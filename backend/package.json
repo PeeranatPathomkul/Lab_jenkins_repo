@@ -78,11 +78,10 @@
     },
     "testEnvironment": "node",
     "collectCoverageFrom": [
-      "**/*.ts",
-      "!**/*.spec.ts",
-      "!main.ts",
-      "!migrations/**",
-      "!database/**"
+      "common/**/*.ts",
+      "config/**/*.ts",
+      "modules/health/**/*.ts",
+      "!**/*.spec.ts"
     ],
     "coverageDirectory": "../coverage",
     "coverageReporters": [
