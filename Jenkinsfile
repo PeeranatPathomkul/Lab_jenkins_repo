@@ -98,6 +98,48 @@ pipeline {
             }
         }
 
+        stage('SonarQube Analysis') {
+            // Scanner runs in its own throwaway container on linux-build. The
+            // workspace (with backend/coverage/lcov.info from Unit Test) is the
+            // same one the CI stage used. --network jenkins lets it reach
+            // http://sonarqube:9000.
+            agent {
+                docker {
+                    image 'sonarsource/sonar-scanner-cli:latest'
+                    label 'linux-build'
+                    args '--network jenkins --entrypoint= -e SONAR_USER_HOME=/tmp/.sonar'
+                }
+            }
+            options {
+                // Same reasoning as the CI stage: never let a stuck upload hold
+                // the executor.
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                // Injects SONAR_HOST_URL and the sonar-token credential configured
+                // under Manage Jenkins -> System -> SonarQube servers.
+                withSonarQubeEnv('SonarQube') {
+                    dir('backend') {
+                        // Project key, sources and coverage path live in
+                        // backend/sonar-project.properties.
+                        sh 'sonar-scanner'
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            // No agent: waitForQualityGate only waits for SonarQube's webhook, so
+            // it should not hold linux-build's executor while it waits.
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
         stage('Deploy — Staging') {
             when {
                 // Skip the agent entirely on branches that do not deploy.
