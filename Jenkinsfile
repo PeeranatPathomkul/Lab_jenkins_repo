@@ -66,7 +66,25 @@ pipeline {
                     steps {
                         script { env.CURRENT_STAGE = env.STAGE_NAME }
                         dir('backend') {
-                            sh 'npm test'
+                            // `default` keeps Jest's console summary in the log;
+                            // jest-junit writes backend/reports/junit.xml.
+                            sh 'npm test -- --coverage --reporters=default --reporters=jest-junit'
+                        }
+                    }
+                    post {
+                        always {
+                            // Publish even when tests fail, so the red build still
+                            // shows which tests broke and feeds the trend graph.
+                            junit 'backend/reports/junit.xml'
+                            // publishCoverage/coberturaAdapter (Code Coverage API
+                            // plugin) is deprecated; recordCoverage from the
+                            // Coverage plugin reads the same Cobertura XML.
+                            recordCoverage(
+                                tools: [[parser: 'COBERTURA', pattern: 'backend/coverage/cobertura-coverage.xml']],
+                                sourceDirectories: [[path: 'backend/src']],
+                                id: 'unit-coverage',
+                                name: 'Unit Test Coverage'
+                            )
                         }
                     }
                 }
