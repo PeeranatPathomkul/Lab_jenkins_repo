@@ -8,6 +8,12 @@ export class HealthController {
     private readonly db: TypeOrmHealthIndicator,
   ) {}
 
+  /** Plain `GET /health` alias of `live`, for smoke tests and load balancers. */
+  @Get()
+  check() {
+    return this.live();
+  }
+
   /** Process is up. Never touches dependencies — used for restart decisions. */
   @Get('live')
   live() {
