@@ -7,14 +7,15 @@ import { getBookingHoldMs } from '../../config/booking.config';
 // promptpay-qr is CommonJS with a default export function; qrcode is CommonJS
 // too. Loaded via require (with typed casts) so no esModuleInterop / @types are
 // needed just for these two.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 const generatePayload = require('promptpay-qr') as (
   target: string,
   opts?: { amount?: number },
 ) => string;
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 const QRCode = require('qrcode') as {
   toBuffer: (text: string, opts?: Record<string, unknown>) => Promise<Buffer>;
 };
-
 /**
  * Public payment information + a dynamic PromptPay QR.
  *
