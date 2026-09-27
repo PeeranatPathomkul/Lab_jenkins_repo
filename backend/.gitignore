@@ -5,6 +5,7 @@ dist/
 *.log
 coverage/
 reports/
+audit.json
 
 # uploaded payment slips (runtime data)
 uploads/*

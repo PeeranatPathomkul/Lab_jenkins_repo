@@ -100,6 +100,62 @@ pipeline {
             }
         }
 
+        stage('SCA — npm audit') {
+            // Software Composition Analysis: known CVEs in third-party packages,
+            // read straight from package-lock.json (no install needed).
+            agent {
+                docker {
+                    image 'node:20-alpine'
+                    label 'linux-build'
+                    args '-e npm_config_cache=/tmp/.npm'
+                }
+            }
+            options {
+                timeout(time: 5, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                dir('backend') {
+                    // npm audit exits non-zero whenever anything >= high exists;
+                    // `|| true` hands the verdict to the threshold logic below
+                    // instead of that exit code.
+                    sh 'npm audit --audit-level=high --json > audit.json || true'
+                    script {
+                        // node:20-alpine has no jq, so read the counts with node.
+                        def count = { String level ->
+                            sh(
+                                script: "node -p \"require('./audit.json').metadata.vulnerabilities.${level}\"",
+                                returnStdout: true
+                            ).trim().toInteger()
+                        }
+                        def critical = count('critical')
+                        def high = count('high')
+                        echo "SCA summary: critical=${critical}, high=${high}, moderate=${count('moderate')}, low=${count('low')}"
+
+                        if (critical > 0) {
+                            // FAIL: marks this stage and the build as FAILURE, but
+                            // lets the pipeline reach SBOM + Policy Gate, which is
+                            // the stage that actually stops it before any build.
+                            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                error("Blocking: ${critical} critical vulnerabilities found")
+                            }
+                        } else if (high > 0) {
+                            // WARN: visible in the log, but not build-breaking.
+                            echo "WARNING: ${high} high vulnerabilities (allowed; fix when a patch is available)"
+                            echo 'SCA passed with 0 critical vulnerabilities (warnings allowed)'
+                        } else {
+                            echo 'SCA passed with 0 critical vulnerabilities (warnings allowed)'
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'backend/audit.json', allowEmptyArchive: true
+                }
+            }
+        }
+
         stage('CI') {
             // Run every CI step inside a throwaway node:20-alpine container,
             // started on the linux-build agent (the only node with a Docker CLI
