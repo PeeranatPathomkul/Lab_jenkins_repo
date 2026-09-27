@@ -12,6 +12,34 @@ pipeline {
     }
 
     stages {
+        stage('Secrets Detection') {
+            // Shift-left: the first gate, before anything is installed or built.
+            // A leaked credential is cheapest to fix here, before it spreads.
+            agent {
+                docker {
+                    image 'zricethezav/gitleaks:v8.30.1'
+                    label 'linux-build'
+                    args '--entrypoint='
+                }
+            }
+            options {
+                timeout(time: 5, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                // `gitleaks git` walks the full commit history of the checked-out
+                // branch (git log -p), not just the current files. Exits 1 on any
+                // finding, which fails the stage and stops the pipeline here.
+                // --redact keeps the secret value itself out of the log/report.
+                sh 'gitleaks git . --no-banner --redact --verbose --report-format json --report-path gitleaks-report.json'
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+
         stage('CI') {
             // Run every CI step inside a throwaway node:20-alpine container,
             // started on the linux-build agent (the only node with a Docker CLI
