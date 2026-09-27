@@ -156,6 +156,62 @@ pipeline {
             }
         }
 
+        stage('Generate SBOM') {
+            // Syft and Cosign ship as distroless images (no shell), so they
+            // cannot be a `docker { }` agent. Instead this runs on linux-build
+            // and starts them with `docker run --volumes-from` this agent
+            // container, which shares the workspace volume with them.
+            agent { label 'linux-build' }
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            environment {
+                SYFT_IMAGE = 'anchore/syft:v1.52.0'
+                COSIGN_IMAGE = 'ghcr.io/sigstore/cosign/cosign:v3.1.3'
+                SBOM = 'sbom/poonsuk-api.cdx.json'
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                sh 'mkdir -p sbom'
+                // CycloneDX SBOM of backend/ (package-lock.json -> every npm
+                // package and version), tagged with the commit it describes.
+                sh '''
+                    docker run --rm --volumes-from "$(hostname)" -w "$WORKSPACE" \
+                      -u "$(id -u):$(id -g)" -e XDG_CACHE_HOME=/tmp \
+                      "$SYFT_IMAGE" scan dir:backend \
+                      --source-name poonsuk-api --source-version "$GIT_COMMIT" \
+                      -o cyclonedx-json="$SBOM"
+                '''
+                // Sign with the lab's local Cosign key pair. The private key and
+                // its password come only from Jenkins credentials. No
+                // transparency-log upload: the lab key is not a public identity.
+                withCredentials([
+                    file(credentialsId: 'cosign-key', variable: 'COSIGN_KEY'),
+                    string(credentialsId: 'cosign-password', variable: 'COSIGN_PASSWORD'),
+                ]) {
+                    sh '''
+                        docker run --rm --volumes-from "$(hostname)" -w "$WORKSPACE" \
+                          -u "$(id -u):$(id -g)" -e COSIGN_PASSWORD \
+                          "$COSIGN_IMAGE" sign-blob --yes --key "$COSIGN_KEY" \
+                          --use-signing-config=false --new-bundle-format=false --tlog-upload=false \
+                          --output-signature "$SBOM.sig" "$SBOM"
+                    '''
+                }
+                // Prove the signature matches the committed public key.
+                sh '''
+                    docker run --rm --volumes-from "$(hostname)" -w "$WORKSPACE" \
+                      -u "$(id -u):$(id -g)" \
+                      "$COSIGN_IMAGE" verify-blob --key cosign.pub \
+                      --signature "$SBOM.sig" --insecure-ignore-tlog=true "$SBOM"
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'sbom/poonsuk-api.cdx.json, sbom/poonsuk-api.cdx.json.sig', allowEmptyArchive: true
+                }
+            }
+        }
+
         stage('CI') {
             // Run every CI step inside a throwaway node:20-alpine container,
             // started on the linux-build agent (the only node with a Docker CLI
