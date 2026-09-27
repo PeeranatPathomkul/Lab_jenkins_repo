@@ -40,6 +40,66 @@ pipeline {
             }
         }
 
+        stage('SAST — ESLint') {
+            // Static analysis of our own code for insecure patterns, right after
+            // secrets and before dependencies (SCA) or any build.
+            agent {
+                docker {
+                    image 'node:20-alpine'
+                    label 'linux-build'
+                    args '-e npm_config_cache=/tmp/.npm'
+                }
+            }
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                dir('backend') {
+                    sh 'npm ci'
+                    // Manual: `npx eslint --plugin security src/`. ESLint 9 has no
+                    // --plugin flag, so eslint.security.config.mjs loads
+                    // eslint-plugin-security instead. Findings are warnings: they
+                    // are reported (log + SARIF), not build-breaking.
+                    sh 'npx eslint -c eslint.security.config.mjs src/'
+                    sh 'mkdir -p reports && npx eslint -c eslint.security.config.mjs src/ -f @microsoft/eslint-formatter-sarif -o reports/eslint-security.sarif'
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'backend/reports/eslint-security.sarif', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('SAST — Semgrep') {
+            agent {
+                docker {
+                    image 'semgrep/semgrep:1.177.0'
+                    label 'linux-build'
+                    // Semgrep keeps settings under $HOME, which the agent UID
+                    // cannot write in this image.
+                    args '-e HOME=/tmp'
+                }
+            }
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                // OWASP Top 10 + Node.js rule packs from the Semgrep Registry.
+                // One run prints the summary to the log and writes SARIF.
+                // Semgrep exits 0 even with findings (no --error), so like ESLint
+                // this stage reports; blocking lives in SCA and the Policy Gate.
+                sh 'semgrep scan --config=p/owasp-top-ten --config=p/nodejs --metrics=off --sarif-output=semgrep.sarif backend/src'
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'semgrep.sarif', allowEmptyArchive: true
+                }
+            }
+        }
+
         stage('CI') {
             // Run every CI step inside a throwaway node:20-alpine container,
             // started on the linux-build agent (the only node with a Docker CLI
