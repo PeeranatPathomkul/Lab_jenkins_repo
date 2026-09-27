@@ -4,6 +4,7 @@ dist/
 .env.example
 *.log
 coverage/
+reports/
 
 # uploaded payment slips (runtime data)
 uploads/*

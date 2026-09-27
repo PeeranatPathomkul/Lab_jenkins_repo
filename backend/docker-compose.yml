@@ -3,7 +3,10 @@ services:
     build:
       context: .
       target: production
-    env_file: .env
+    # Optional so CI (docker-compose.ci.yml) can run without a local .env.
+    env_file:
+      - path: .env
+        required: false
     environment:
       # Inside the compose network the API talks to the container ports
       # directly, so these override whatever .env says for host access.

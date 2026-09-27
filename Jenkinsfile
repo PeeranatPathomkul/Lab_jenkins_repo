@@ -66,7 +66,25 @@ pipeline {
                     steps {
                         script { env.CURRENT_STAGE = env.STAGE_NAME }
                         dir('backend') {
-                            sh 'npm test'
+                            // `default` keeps Jest's console summary in the log;
+                            // jest-junit writes backend/reports/junit.xml.
+                            sh 'npm test -- --coverage --reporters=default --reporters=jest-junit'
+                        }
+                    }
+                    post {
+                        always {
+                            // Publish even when tests fail, so the red build still
+                            // shows which tests broke and feeds the trend graph.
+                            junit 'backend/reports/junit.xml'
+                            // publishCoverage/coberturaAdapter (Code Coverage API
+                            // plugin) is deprecated; recordCoverage from the
+                            // Coverage plugin reads the same Cobertura XML.
+                            recordCoverage(
+                                tools: [[parser: 'COBERTURA', pattern: 'backend/coverage/cobertura-coverage.xml']],
+                                sourceDirectories: [[path: 'backend/src']],
+                                id: 'unit-coverage',
+                                name: 'Unit Test Coverage'
+                            )
                         }
                     }
                 }
@@ -76,6 +94,113 @@ pipeline {
                     // Needs a workspace, so it lives here rather than in the
                     // pipeline-level post (which has no agent with `agent none`).
                     archiveArtifacts artifacts: '**/npm-debug.log*', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('E2E') {
+            // Needs the Docker CLI + compose plugin, so it runs directly on
+            // linux-build; the Playwright tests themselves run inside the
+            // mcr.microsoft.com/playwright container below.
+            agent { label 'linux-build' }
+            options {
+                // Building the API image + migrations + tests takes a few
+                // minutes; still never unbounded.
+                timeout(time: 15, unit: 'MINUTES')
+            }
+            environment {
+                // Fixed project name, so the compose network is always
+                // poonsuk-e2e_default for the Playwright container to join.
+                COMPOSE = 'docker compose -p poonsuk-e2e -f docker-compose.yml -f docker-compose.ci.yml'
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                dir('backend') {
+                    // Fresh database every run: schema via migrations, demo
+                    // users/rooms via the seed scripts, then start the API and
+                    // wait for /health/ready.
+                    sh '$COMPOSE down -v --remove-orphans || true'
+                    sh '$COMPOSE build api'
+                    sh '$COMPOSE up -d --wait postgres redis'
+                    sh '$COMPOSE run --rm --no-deps api npx typeorm migration:run -d dist/config/data-source.js'
+                    sh '$COMPOSE run --rm --no-deps api node dist/database/seed-users.js'
+                    sh '$COMPOSE run --rm --no-deps api node dist/database/seed-rooms.js'
+                    sh '$COMPOSE up -d --wait api'
+                }
+                script {
+                    docker.image('mcr.microsoft.com/playwright:v1.63.0-noble')
+                        .inside('--network poonsuk-e2e_default -e HOME=/tmp -e npm_config_cache=/tmp/.npm -e CI=true -e E2E_BASE_URL=http://api:3000') {
+                            dir('e2e') {
+                                sh 'npm ci'
+                                sh 'npx playwright test'
+                            }
+                        }
+                }
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: 'e2e/results/junit.xml'
+                    publishHTML(target: [
+                        reportName: 'Playwright Report',
+                        reportDir: 'e2e/playwright-report',
+                        reportFiles: 'index.html',
+                        keepAll: true,
+                        alwaysLinkToLastBuild: true,
+                        allowMissing: true,
+                    ])
+                    archiveArtifacts artifacts: 'e2e/playwright-report/**', allowEmptyArchive: true
+                }
+                unsuccessful {
+                    dir('backend') {
+                        sh '$COMPOSE logs --no-color --tail=100 api || true'
+                    }
+                }
+                cleanup {
+                    dir('backend') {
+                        sh '$COMPOSE down -v --remove-orphans || true'
+                    }
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            // Scanner runs in its own throwaway container on linux-build. The
+            // workspace (with backend/coverage/lcov.info from Unit Test) is the
+            // same one the CI stage used. --network jenkins lets it reach
+            // http://sonarqube:9000.
+            agent {
+                docker {
+                    image 'sonarsource/sonar-scanner-cli:latest'
+                    label 'linux-build'
+                    args '--network jenkins --entrypoint= -e SONAR_USER_HOME=/tmp/.sonar'
+                }
+            }
+            options {
+                // Same reasoning as the CI stage: never let a stuck upload hold
+                // the executor.
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                // Injects SONAR_HOST_URL and the sonar-token credential configured
+                // under Manage Jenkins -> System -> SonarQube servers.
+                withSonarQubeEnv('SonarQube') {
+                    dir('backend') {
+                        // Project key, sources and coverage path live in
+                        // backend/sonar-project.properties.
+                        sh 'sonar-scanner'
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            // No agent: waitForQualityGate only waits for SonarQube's webhook, so
+            // it should not hold linux-build's executor while it waits.
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
                 }
             }
         }

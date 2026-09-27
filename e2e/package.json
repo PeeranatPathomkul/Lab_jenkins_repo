@@ -1,0 +1,12 @@
+{
+  "name": "poonsuk-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Playwright end-to-end API tests against a Dockerized poonsuk-api (Lab 05)",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}

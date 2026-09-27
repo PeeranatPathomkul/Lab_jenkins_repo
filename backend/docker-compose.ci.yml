@@ -1,0 +1,26 @@
+# CI overrides for the Jenkinsfile's E2E stage (Lab 05). Used as:
+#   docker compose -p poonsuk-e2e -f docker-compose.yml -f docker-compose.ci.yml ...
+#
+# - No host port mappings: the Playwright container reaches the API over the
+#   compose network (http://api:3000), so CI never collides with anything
+#   already listening on the Docker host.
+# - A healthcheck on the API so `docker compose up --wait` returns only once
+#   /health/ready (which pings the database) answers.
+# - Throwaway, CI-only values instead of a .env file.
+services:
+  api:
+    environment:
+      NODE_ENV: production
+      JWT_ACCESS_SECRET: ci-only-e2e-signing-key
+    ports: !reset []
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+
+  postgres:
+    ports: !reset []
+
+  redis:
+    ports: !reset []
