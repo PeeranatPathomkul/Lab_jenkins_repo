@@ -212,6 +212,43 @@ pipeline {
             }
         }
 
+        stage('Policy Gate') {
+            // The last security gate before any build: OPA decides, from the SCA
+            // report, whether this commit may continue. Unlike the SCA stage,
+            // a deny here stops the pipeline outright.
+            agent { label 'linux-build' }
+            options {
+                timeout(time: 5, unit: 'MINUTES')
+            }
+            environment {
+                // Distroless image, so it is run via docker, like Syft/Cosign.
+                OPA_IMAGE = 'openpolicyagent/opa:1.21.0'
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                // Unit tests for the policy itself (policy/security_test.rego).
+                sh '''
+                    docker run --rm --volumes-from "$(hostname)" -w "$WORKSPACE" \
+                      -u "$(id -u):$(id -g)" "$OPA_IMAGE" test policy/ -v
+                '''
+                script {
+                    // --fail-defined: exit non-zero if any deny message exists.
+                    // A missing/unreadable audit.json also exits non-zero, so the
+                    // gate fails closed.
+                    def status = sh(returnStatus: true, script: '''
+                        docker run --rm --volumes-from "$(hostname)" -w "$WORKSPACE" \
+                          -u "$(id -u):$(id -g)" "$OPA_IMAGE" eval --fail-defined --format pretty \
+                          --data policy/security.rego --input backend/audit.json \
+                          "data.security.deny[msg]"
+                    ''')
+                    if (status != 0) {
+                        error('Policy Gate: build denied by policy/security.rego (see deny messages above)')
+                    }
+                    echo 'Policy Gate: allowed - no CRITICAL vulnerabilities in the dependency scan'
+                }
+            }
+        }
+
         stage('CI') {
             // Run every CI step inside a throwaway node:20-alpine container,
             // started on the linux-build agent (the only node with a Docker CLI
