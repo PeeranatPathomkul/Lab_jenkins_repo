@@ -513,6 +513,52 @@ pipeline {
             }
         }
 
+        stage('Blue/Green Deploy') {
+            // Deploy the scanned image to the idle colour in the kind cluster,
+            // smoke-test it there, then flip the live Service's selector.
+            // Lab scope: runs for every branch build (not PR builds) against the
+            // single local cluster; a real pipeline would limit this to main.
+            when {
+                beforeAgent true
+                not { changeRequest() }
+            }
+            agent { label 'linux-build' }
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                // kubeconfig for the kind cluster (API server reached over the
+                // `kind` Docker network) comes only from Jenkins credentials.
+                withCredentials([file(credentialsId: 'kubeconfig-kind', variable: 'KUBECONFIG')]) {
+                    script {
+                        def current = sh(
+                            script: "kubectl get svc taskflow -o jsonpath='{.spec.selector.color}'",
+                            returnStdout: true
+                        ).trim()
+                        def next = current == 'blue' ? 'green' : 'blue'
+                        echo "Live colour: ${current}. Deploying ${env.IMAGE} to ${next}."
+
+                        // Service before the switch (Lab 07 deliverable).
+                        sh 'kubectl get svc taskflow -o yaml'
+
+                        sh "kubectl set image deployment/taskflow-${next} app=${env.IMAGE}"
+                        sh "kubectl rollout status deployment/taskflow-${next} --timeout=120s"
+
+                        // Smoke test the new pods directly through their own
+                        // Service (taskflow-<colour>), bypassing the live one.
+                        sh "kubectl run smoke-${env.IMAGE_TAG}-${env.BUILD_NUMBER} --rm -i --restart=Never --image=curlimages/curl -- curl -sf http://taskflow-${next}:8080/health"
+
+                        sh """kubectl patch svc taskflow -p '{"spec":{"selector":{"color":"${next}"}}}'"""
+                        echo "Switched traffic from ${current} to ${next}"
+
+                        // Service after the switch (Lab 07 deliverable).
+                        sh 'kubectl get svc taskflow -o yaml'
+                    }
+                }
+            }
+        }
+
         stage('Deploy — Staging') {
             when {
                 // Skip the agent entirely on branches that do not deploy.
