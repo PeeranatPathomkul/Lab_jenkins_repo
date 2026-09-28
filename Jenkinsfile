@@ -12,6 +12,243 @@ pipeline {
     }
 
     stages {
+        stage('Secrets Detection') {
+            // Shift-left: the first gate, before anything is installed or built.
+            // A leaked credential is cheapest to fix here, before it spreads.
+            agent {
+                docker {
+                    image 'zricethezav/gitleaks:v8.30.1'
+                    label 'linux-build'
+                    args '--entrypoint='
+                }
+            }
+            options {
+                timeout(time: 5, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                // `gitleaks git` walks the full commit history of the checked-out
+                // branch (git log -p), not just the current files. Exits 1 on any
+                // finding, which fails the stage and stops the pipeline here.
+                // --redact keeps the secret value itself out of the log/report.
+                sh 'gitleaks git . --no-banner --redact --verbose --report-format json --report-path gitleaks-report.json'
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('SAST — ESLint') {
+            // Static analysis of our own code for insecure patterns, right after
+            // secrets and before dependencies (SCA) or any build.
+            agent {
+                docker {
+                    image 'node:20-alpine'
+                    label 'linux-build'
+                    args '-e npm_config_cache=/tmp/.npm'
+                }
+            }
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                dir('backend') {
+                    sh 'npm ci'
+                    // Manual: `npx eslint --plugin security src/`. ESLint 9 has no
+                    // --plugin flag, so eslint.security.config.mjs loads
+                    // eslint-plugin-security instead. Findings are warnings: they
+                    // are reported (log + SARIF), not build-breaking.
+                    sh 'npx eslint -c eslint.security.config.mjs src/'
+                    sh 'mkdir -p reports && npx eslint -c eslint.security.config.mjs src/ -f @microsoft/eslint-formatter-sarif -o reports/eslint-security.sarif'
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'backend/reports/eslint-security.sarif', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('SAST — Semgrep') {
+            agent {
+                docker {
+                    image 'semgrep/semgrep:1.177.0'
+                    label 'linux-build'
+                    // Semgrep keeps settings under $HOME, which the agent UID
+                    // cannot write in this image.
+                    args '-e HOME=/tmp'
+                }
+            }
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                // OWASP Top 10 + Node.js rule packs from the Semgrep Registry.
+                // One run prints the summary to the log and writes SARIF.
+                // Semgrep exits 0 even with findings (no --error), so like ESLint
+                // this stage reports; blocking lives in SCA and the Policy Gate.
+                sh 'semgrep scan --config=p/owasp-top-ten --config=p/nodejs --metrics=off --sarif-output=semgrep.sarif backend/src'
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'semgrep.sarif', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('SCA — npm audit') {
+            // Software Composition Analysis: known CVEs in third-party packages,
+            // read straight from package-lock.json (no install needed).
+            agent {
+                docker {
+                    image 'node:20-alpine'
+                    label 'linux-build'
+                    args '-e npm_config_cache=/tmp/.npm'
+                }
+            }
+            options {
+                timeout(time: 5, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                dir('backend') {
+                    // npm audit exits non-zero whenever anything >= high exists;
+                    // `|| true` hands the verdict to the threshold logic below
+                    // instead of that exit code.
+                    sh 'npm audit --audit-level=high --json > audit.json || true'
+                    script {
+                        // node:20-alpine has no jq, so read the counts with node.
+                        def count = { String level ->
+                            sh(
+                                script: "node -p \"require('./audit.json').metadata.vulnerabilities.${level}\"",
+                                returnStdout: true
+                            ).trim().toInteger()
+                        }
+                        def critical = count('critical')
+                        def high = count('high')
+                        echo "SCA summary: critical=${critical}, high=${high}, moderate=${count('moderate')}, low=${count('low')}"
+
+                        if (critical > 0) {
+                            // FAIL: marks this stage and the build as FAILURE, but
+                            // lets the pipeline reach SBOM + Policy Gate, which is
+                            // the stage that actually stops it before any build.
+                            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                error("Blocking: ${critical} critical vulnerabilities found")
+                            }
+                        } else if (high > 0) {
+                            // WARN: visible in the log, but not build-breaking.
+                            echo "WARNING: ${high} high vulnerabilities (allowed; fix when a patch is available)"
+                            echo 'SCA passed with 0 critical vulnerabilities (warnings allowed)'
+                        } else {
+                            echo 'SCA passed with 0 critical vulnerabilities (warnings allowed)'
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'backend/audit.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Generate SBOM') {
+            // Syft and Cosign ship as distroless images (no shell), so they
+            // cannot be a `docker { }` agent. Instead this runs on linux-build
+            // and starts them with `docker run --volumes-from` this agent
+            // container, which shares the workspace volume with them.
+            agent { label 'linux-build' }
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            environment {
+                SYFT_IMAGE = 'anchore/syft:v1.52.0'
+                COSIGN_IMAGE = 'ghcr.io/sigstore/cosign/cosign:v3.1.3'
+                SBOM = 'sbom/poonsuk-api.cdx.json'
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                sh 'mkdir -p sbom'
+                // CycloneDX SBOM of backend/ (package-lock.json -> every npm
+                // package and version), tagged with the commit it describes.
+                sh '''
+                    docker run --rm --volumes-from "$(hostname)" -w "$WORKSPACE" \
+                      -u "$(id -u):$(id -g)" -e XDG_CACHE_HOME=/tmp \
+                      "$SYFT_IMAGE" scan dir:backend \
+                      --source-name poonsuk-api --source-version "$GIT_COMMIT" \
+                      -o cyclonedx-json="$SBOM"
+                '''
+                // Sign with the lab's local Cosign key pair. The private key and
+                // its password come only from Jenkins credentials. No
+                // transparency-log upload: the lab key is not a public identity.
+                withCredentials([
+                    file(credentialsId: 'cosign-key', variable: 'COSIGN_KEY'),
+                    string(credentialsId: 'cosign-password', variable: 'COSIGN_PASSWORD'),
+                ]) {
+                    sh '''
+                        docker run --rm --volumes-from "$(hostname)" -w "$WORKSPACE" \
+                          -u "$(id -u):$(id -g)" -e COSIGN_PASSWORD \
+                          "$COSIGN_IMAGE" sign-blob --yes --key "$COSIGN_KEY" \
+                          --use-signing-config=false --new-bundle-format=false --tlog-upload=false \
+                          --output-signature "$SBOM.sig" "$SBOM"
+                    '''
+                }
+                // Prove the signature matches the committed public key.
+                sh '''
+                    docker run --rm --volumes-from "$(hostname)" -w "$WORKSPACE" \
+                      -u "$(id -u):$(id -g)" \
+                      "$COSIGN_IMAGE" verify-blob --key cosign.pub \
+                      --signature "$SBOM.sig" --insecure-ignore-tlog=true "$SBOM"
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'sbom/poonsuk-api.cdx.json, sbom/poonsuk-api.cdx.json.sig', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Policy Gate') {
+            // The last security gate before any build: OPA decides, from the SCA
+            // report, whether this commit may continue. Unlike the SCA stage,
+            // a deny here stops the pipeline outright.
+            agent { label 'linux-build' }
+            options {
+                timeout(time: 5, unit: 'MINUTES')
+            }
+            environment {
+                // Distroless image, so it is run via docker, like Syft/Cosign.
+                OPA_IMAGE = 'openpolicyagent/opa:1.21.0'
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                // Unit tests for the policy itself (policy/security_test.rego).
+                sh '''
+                    docker run --rm --volumes-from "$(hostname)" -w "$WORKSPACE" \
+                      -u "$(id -u):$(id -g)" "$OPA_IMAGE" test policy/ -v
+                '''
+                script {
+                    // --fail-defined: exit non-zero if any deny message exists.
+                    // A missing/unreadable audit.json also exits non-zero, so the
+                    // gate fails closed.
+                    def status = sh(returnStatus: true, script: '''
+                        docker run --rm --volumes-from "$(hostname)" -w "$WORKSPACE" \
+                          -u "$(id -u):$(id -g)" "$OPA_IMAGE" eval --fail-defined --format pretty \
+                          --data policy/security.rego --input backend/audit.json \
+                          "data.security.deny[msg]"
+                    ''')
+                    if (status != 0) {
+                        error('Policy Gate: build denied by policy/security.rego (see deny messages above)')
+                    }
+                    echo 'Policy Gate: allowed - no CRITICAL vulnerabilities in the dependency scan'
+                }
+            }
+        }
+
         stage('CI') {
             // Run every CI step inside a throwaway node:20-alpine container,
             // started on the linux-build agent (the only node with a Docker CLI
