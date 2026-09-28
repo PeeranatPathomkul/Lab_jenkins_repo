@@ -359,7 +359,9 @@ pipeline {
                     sh '$COMPOSE down -v --remove-orphans || true'
                     sh '$COMPOSE build api'
                     sh '$COMPOSE up -d --wait postgres redis'
-                    sh '$COMPOSE run --rm --no-deps api npx typeorm migration:run -d dist/config/data-source.js'
+                    // The production image ships without npm/npx (Lab 07), so
+                    // call the TypeORM CLI with node directly.
+                    sh '$COMPOSE run --rm --no-deps api node node_modules/typeorm/cli.js migration:run -d dist/config/data-source.js'
                     sh '$COMPOSE run --rm --no-deps api node dist/database/seed-users.js'
                     sh '$COMPOSE run --rm --no-deps api node dist/database/seed-rooms.js'
                     sh '$COMPOSE up -d --wait api'
