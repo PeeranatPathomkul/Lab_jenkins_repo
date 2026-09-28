@@ -1,0 +1,19 @@
+# One-off schema migration for the in-cluster database (Lab 07 setup).
+# Uses the same image as the API; the image has no npm/npx, so the TypeORM CLI
+# is called with node directly.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: taskflow-migrate
+spec:
+  backoffLimit: 4
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: localhost:5000/poonsuk-api:c5fcfdf
+          envFrom:
+            - configMapRef: { name: taskflow-config }
+            - secretRef: { name: taskflow-secrets }
+          command: ["node", "node_modules/typeorm/cli.js", "migration:run", "-d", "dist/config/data-source.js"]

@@ -1,0 +1,12 @@
+# Lab 07 local Kubernetes cluster:  kind create cluster --config k8s/kind-config.yaml
+#
+# Lets containerd read per-registry settings from /etc/containerd/certs.d, so
+# the node can pull `localhost:5000/poonsuk-api:<tag>` from the `registry`
+# container (see the hosts.toml step in the lab instructions).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: taskflow
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry]
+      config_path = "/etc/containerd/certs.d"

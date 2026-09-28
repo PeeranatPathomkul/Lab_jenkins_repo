@@ -1,0 +1,102 @@
+# Lab 07 blue/green deployment of poonsuk-api.
+#
+#   Deployment taskflow-blue   (pods labelled app=taskflow, color=blue)
+#   Deployment taskflow-green  (pods labelled app=taskflow, color=green)
+#   Service    taskflow        <- the live one; its `color` selector decides
+#                                 which Deployment gets the traffic
+#   Service    taskflow-blue / taskflow-green
+#                              <- always point at one colour, so a new version
+#                                 can be smoke-tested before the switch
+#
+# The pipeline changes only the idle colour's image and then the live
+# Service's selector; switching back (rollback) is a label change.
+# Both colours start on the same known-good image; later images come from the
+# Jenkins "Blue/Green Deploy" stage.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taskflow-blue
+  labels: { app: taskflow, color: blue }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: taskflow, color: blue }
+  template:
+    metadata:
+      labels: { app: taskflow, color: blue }
+    spec:
+      containers:
+        - name: app
+          image: localhost:5000/poonsuk-api:c5fcfdf
+          envFrom:
+            - configMapRef: { name: taskflow-config }
+            - secretRef: { name: taskflow-secrets }
+          ports:
+            - containerPort: 3000
+          readinessProbe:
+            httpGet: { path: /health/ready, port: 3000 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health/live, port: 3000 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taskflow-green
+  labels: { app: taskflow, color: green }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: taskflow, color: green }
+  template:
+    metadata:
+      labels: { app: taskflow, color: green }
+    spec:
+      containers:
+        - name: app
+          image: localhost:5000/poonsuk-api:c5fcfdf
+          envFrom:
+            - configMapRef: { name: taskflow-config }
+            - secretRef: { name: taskflow-secrets }
+          ports:
+            - containerPort: 3000
+          readinessProbe:
+            httpGet: { path: /health/ready, port: 3000 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health/live, port: 3000 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+---
+# The live Service. Blue serves traffic first.
+apiVersion: v1
+kind: Service
+metadata:
+  name: taskflow
+spec:
+  selector: { app: taskflow, color: blue }
+  ports:
+    - port: 8080
+      targetPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: taskflow-blue
+spec:
+  selector: { app: taskflow, color: blue }
+  ports:
+    - port: 8080
+      targetPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: taskflow-green
+spec:
+  selector: { app: taskflow, color: green }
+  ports:
+    - port: 8080
+      targetPort: 3000
