@@ -11,6 +11,18 @@ pipeline {
         NODE_ENV = 'test'
     }
 
+    parameters {
+        // Lab 07 fault injection: deploy a known-broken image to prove the
+        // automatic blue/green rollback. Empty (the default, and what every
+        // webhook-triggered build uses) deploys the image this run built and
+        // scanned. Never set it outside the lab: it bypasses the Trivy gate.
+        string(
+            name: 'DEPLOY_IMAGE_OVERRIDE',
+            defaultValue: '',
+            description: 'Lab 07 only: image to deploy instead of this build\'s image (leave empty)'
+        )
+    }
+
     stages {
         stage('Secrets Detection') {
             // Shift-left: the first gate, before anything is installed or built.
@@ -540,12 +552,18 @@ pipeline {
                         // Remembered for the automatic rollback in post.failure.
                         env.BG_PREVIOUS = current
                         env.BG_NEXT = next
-                        echo "Live colour: ${current}. Deploying ${env.IMAGE} to ${next}."
+
+                        def override = params.DEPLOY_IMAGE_OVERRIDE?.trim()
+                        def image = override ?: env.IMAGE
+                        if (override) {
+                            echo "FAULT INJECTION: deploying ${override} instead of ${env.IMAGE}"
+                        }
+                        echo "Live colour: ${current}. Deploying ${image} to ${next}."
 
                         // Service before the switch (Lab 07 deliverable).
                         sh 'kubectl get svc taskflow -o yaml'
 
-                        sh "kubectl set image deployment/taskflow-${next} app=${env.IMAGE}"
+                        sh "kubectl set image deployment/taskflow-${next} app=${image}"
                         sh "kubectl rollout status deployment/taskflow-${next} --timeout=120s"
 
                         // Smoke test the new pods directly through their own
