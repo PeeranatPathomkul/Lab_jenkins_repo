@@ -442,6 +442,42 @@ pipeline {
             }
         }
 
+        stage('Build Image') {
+            // Package the API that passed every gate above into an immutable,
+            // commit-tagged image in the local registry. Never `latest`: a tag
+            // must always mean the same bits, so a deploy or rollback is exact.
+            agent { label 'linux-build' }
+            options {
+                timeout(time: 15, unit: 'MINUTES')
+            }
+            steps {
+                script {
+                    env.CURRENT_STAGE = env.STAGE_NAME
+                    // The host's Docker daemon pushes to the registry container
+                    // through its published port, so the image name uses
+                    // localhost:5000. Later stages reuse IMAGE / IMAGE_TAG.
+                    env.REGISTRY = 'localhost:5000'
+                    env.IMAGE_TAG = env.GIT_COMMIT.take(7)
+                    env.IMAGE = "${env.REGISTRY}/poonsuk-api:${env.IMAGE_TAG}"
+                }
+                sh '''
+                    # Immutability: a commit's tag is pushed once and never
+                    # overwritten; a re-run of the same commit reuses it.
+                    if docker manifest inspect --insecure "$IMAGE" > /dev/null 2>&1; then
+                        echo "$IMAGE already in the registry - not rebuilding or overwriting it"
+                        exit 0
+                    fi
+                    docker build --target production \
+                      --label org.opencontainers.image.revision="$GIT_COMMIT" \
+                      --label org.opencontainers.image.source="$GIT_URL" \
+                      -t "$IMAGE" backend
+                    docker push "$IMAGE"
+                '''
+                // Show what the registry now holds for this repository.
+                sh 'curl -s http://registry:5000/v2/poonsuk-api/tags/list; echo'
+            }
+        }
+
         stage('Deploy — Staging') {
             when {
                 // Skip the agent entirely on branches that do not deploy.
