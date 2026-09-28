@@ -537,6 +537,9 @@ pipeline {
                             returnStdout: true
                         ).trim()
                         def next = current == 'blue' ? 'green' : 'blue'
+                        // Remembered for the automatic rollback in post.failure.
+                        env.BG_PREVIOUS = current
+                        env.BG_NEXT = next
                         echo "Live colour: ${current}. Deploying ${env.IMAGE} to ${next}."
 
                         // Service before the switch (Lab 07 deliverable).
@@ -554,6 +557,30 @@ pipeline {
 
                         // Service after the switch (Lab 07 deliverable).
                         sh 'kubectl get svc taskflow -o yaml'
+                    }
+                }
+            }
+            post {
+                failure {
+                    // Automatic rollback: whatever step failed (rollout, smoke
+                    // test, the switch itself), point the live Service back at
+                    // the colour that was serving before this build. Patching an
+                    // unchanged selector is a no-op, so this is always safe.
+                    withCredentials([file(credentialsId: 'kubeconfig-kind', variable: 'KUBECONFIG')]) {
+                        script {
+                            if (env.BG_PREVIOUS) {
+                                echo "ROLLBACK: deploy to ${env.BG_NEXT} failed - routing traffic back to ${env.BG_PREVIOUS}"
+                                sh """kubectl patch svc taskflow -p '{"spec":{"selector":{"color":"${env.BG_PREVIOUS}"}}}'"""
+                                // Also return the idle colour to its last good
+                                // image, so the next deploy starts from a healthy
+                                // standby instead of a crash-looping one.
+                                sh "kubectl rollout undo deployment/taskflow-${env.BG_NEXT} || true"
+                                sh 'kubectl get svc taskflow -o yaml'
+                                echo "ROLLBACK complete: live colour is ${env.BG_PREVIOUS}"
+                            } else {
+                                echo 'ROLLBACK: failed before the live colour was read - nothing to roll back'
+                            }
+                        }
                     }
                 }
             }
