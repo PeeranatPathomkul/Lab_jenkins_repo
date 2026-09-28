@@ -478,6 +478,39 @@ pipeline {
             }
         }
 
+        stage('Container Scan') {
+            // Scan the exact image that was just pushed (by its commit tag), OS
+            // packages and node_modules alike, before anything deploys it.
+            agent {
+                docker {
+                    image 'aquasec/trivy:0.74.0'
+                    label 'linux-build'
+                    // --network jenkins: pull from http://registry:5000.
+                    // trivy_cache: keep the vulnerability DB between builds
+                    // (volume owned by the agent UID 1000).
+                    args '--entrypoint= --network jenkins -v trivy_cache:/tmp/trivy-cache -e TRIVY_CACHE_DIR=/tmp/trivy-cache -e TRIVY_INSECURE=true'
+                }
+            }
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                // 1) SARIF report, always written (exit 0), so it can be
+                //    archived whether or not the gate below passes.
+                sh 'trivy image --scanners vuln --severity HIGH,CRITICAL --format sarif --output trivy.sarif "registry:5000/poonsuk-api:$IMAGE_TAG"'
+                // 2) The gate: any HIGH or CRITICAL finding exits 1 and fails the
+                //    build before deployment. Same scan (DB is cached), printed
+                //    as a table for the log.
+                sh 'trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --format table "registry:5000/poonsuk-api:$IMAGE_TAG"'
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy.sarif', allowEmptyArchive: true
+                }
+            }
+        }
+
         stage('Deploy — Staging') {
             when {
                 // Skip the agent entirely on branches that do not deploy.
