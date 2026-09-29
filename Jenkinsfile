@@ -282,7 +282,11 @@ pipeline {
                             label 'linux-build'
                             // tf_plugin_cache: providers downloaded once, reused by
                             // every later terraform stage (volume owned by UID 1000).
-                            args '--entrypoint= -e HOME=/tmp -e TF_IN_AUTOMATION=1 -e TF_PLUGIN_CACHE_DIR=/tmp/tf-plugin-cache -v tf_plugin_cache:/tmp/tf-plugin-cache'
+                            // TF_DATA_DIR: a private, throwaway .terraform dir, so
+                            // this backend-less validate never picks up the S3
+                            // backend that Terraform Plan initialised in the shared
+                            // workspace (which would demand AWS credentials).
+                            args '--entrypoint= -e HOME=/tmp -e TF_IN_AUTOMATION=1 -e TF_DATA_DIR=/tmp/tf-validate-data -e TF_PLUGIN_CACHE_DIR=/tmp/tf-plugin-cache -v tf_plugin_cache:/tmp/tf-plugin-cache'
                         }
                     }
                     options {
@@ -721,12 +725,13 @@ pipeline {
         stage('Terraform Apply') {
             // Applies exactly the approved plan file; if the state moved since
             // the plan, Terraform refuses the stale plan instead of guessing.
+            // Also runs (without applying) when the plan had no changes, so the
+            // outputs and the Ansible inventory are always produced.
             when {
                 beforeAgent true
                 allOf {
                     not { changeRequest() }
                     expression { params.APPLY_INFRA }
-                    environment name: 'TF_PLAN_HAS_CHANGES', value: 'true'
                 }
             }
             agent {
@@ -746,15 +751,70 @@ pipeline {
                     dir('infra/terraform') {
                         unstash 'tfplan'
                         sh 'terraform init -input=false'
-                        sh 'terraform apply -input=false -no-color tfplan'
+                        script {
+                            if (env.TF_PLAN_HAS_CHANGES == 'true') {
+                                sh 'terraform apply -input=false -no-color tfplan'
+                            } else {
+                                echo 'Plan had no changes - nothing to apply'
+                            }
+                        }
                         sh 'terraform output -no-color'
                         sh 'terraform output -json > outputs.json'
+                        // Dynamic Ansible inventory, generated from Terraform's
+                        // outputs on every run (the host address is not fixed).
+                        sh '''
+                            printf '[app]\\n%s ansible_host=%s ansible_user=ansible\\n' \
+                              "$(terraform output -raw instance_hostname)" \
+                              "$(terraform output -raw instance_address)" > ../ansible/inventory.ini
+                            cat ../ansible/inventory.ini
+                        '''
                     }
+                    stash name: 'ansible-inventory', includes: 'infra/ansible/inventory.ini'
                 }
             }
             post {
                 always {
-                    archiveArtifacts artifacts: 'infra/terraform/outputs.json', allowEmptyArchive: true
+                    archiveArtifacts artifacts: 'infra/terraform/outputs.json, infra/ansible/inventory.ini', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Configure with Ansible') {
+            // Configure the host Terraform just provisioned: Node.js, Docker,
+            // and this build's scanned API image (by commit tag).
+            when {
+                beforeAgent true
+                allOf {
+                    not { changeRequest() }
+                    expression { params.APPLY_INFRA }
+                }
+            }
+            agent {
+                docker {
+                    image 'alpine/ansible:2.21.0'
+                    label 'linux-build'
+                    // -u 0:0: the SSH client refuses to run for a UID with no
+                    // passwd entry (the agent's 1000 is unknown in this image).
+                    // --network jenkins: reach the host container by address.
+                    args '--entrypoint= -u 0:0 --network jenkins -e HOME=/tmp -e ANSIBLE_HOST_KEY_CHECKING=False -e ANSIBLE_FORCE_COLOR=0'
+                }
+            }
+            options {
+                timeout(time: 20, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                unstash 'ansible-inventory'
+                // The private key lives only in Jenkins credentials; the host
+                // trusts its public half (infra/ansible/ansible.pub via Terraform).
+                withCredentials([sshUserPrivateKey(credentialsId: 'ansible-ssh',
+                        keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
+                    sh '''
+                        ansible-playbook -i infra/ansible/inventory.ini \
+                          --private-key "$SSH_KEY" -u "$SSH_USER" \
+                          -e app_image="registry:5000/poonsuk-api:$IMAGE_TAG" \
+                          infra/ansible/playbook.yml
+                    '''
                 }
             }
         }

@@ -100,11 +100,26 @@ resource "docker_image" "host" {
   }
 }
 
+# Docker's data dir on the host. overlay2 cannot sit on the container's own
+# overlay filesystem, so it needs a volume; destroy removes it with the host.
+resource "docker_volume" "host_docker" {
+  name = "poonsuk-host-docker"
+}
+
 resource "docker_container" "host" {
   name     = "poonsuk-host"
   image    = docker_image.host.image_id
   hostname = "poonsuk-host"
   restart  = "unless-stopped"
+
+  # Ansible installs and starts a Docker daemon inside this "VM"; running
+  # dockerd in a container needs privileged mode (lab stand-in only).
+  privileged = true
+
+  volumes {
+    volume_name    = docker_volume.host_docker.name
+    container_path = "/var/lib/docker"
+  }
 
   networks_advanced {
     name = var.host_network
