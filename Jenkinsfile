@@ -312,6 +312,53 @@ pipeline {
             }
         }
 
+        stage('IaC Security Scan') {
+            // Misconfiguration scan of the Terraform code with two independent
+            // tools, before any plan. Both always run (so both reports exist);
+            // the stage fails if either reports a finding.
+            agent { label 'linux-build' }
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            environment {
+                TFSEC_IMAGE   = 'aquasec/tfsec:v1.28.14'
+                CHECKOV_IMAGE = 'bridgecrew/checkov:3.3.20'
+            }
+            steps {
+                script {
+                    env.CURRENT_STAGE = env.STAGE_NAME
+                    sh 'mkdir -p reports/iac'
+                    // tfsec: SARIF report (never fails), then the gate run whose
+                    // table goes to the log and whose exit code counts.
+                    sh '''
+                        docker run --rm --volumes-from "$(hostname)" -w "$WORKSPACE" -u "$(id -u):$(id -g)" \
+                          "$TFSEC_IMAGE" infra/terraform --no-color --soft-fail \
+                          --format sarif --out reports/iac/tfsec.sarif
+                    '''
+                    def tfsec = sh(returnStatus: true, script: '''
+                        docker run --rm --volumes-from "$(hostname)" -w "$WORKSPACE" -u "$(id -u):$(id -g)" \
+                          "$TFSEC_IMAGE" infra/terraform --no-color
+                    ''')
+                    // checkov: one run prints to the log and writes SARIF.
+                    def checkov = sh(returnStatus: true, script: '''
+                        docker run --rm --volumes-from "$(hostname)" -w "$WORKSPACE" -u "$(id -u):$(id -g)" \
+                          -e HOME=/tmp "$CHECKOV_IMAGE" -d infra/terraform --framework terraform --compact \
+                          -o cli -o sarif --output-file-path console,reports/iac/checkov.sarif
+                    ''')
+                    echo "IaC Security Scan: tfsec exit=${tfsec}, checkov exit=${checkov}"
+                    if (tfsec != 0 || checkov != 0) {
+                        error('IaC Security Scan: misconfigurations found by tfsec and/or checkov (see reports above)')
+                    }
+                    echo 'IaC Security Scan: no findings from tfsec or checkov'
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/iac/*.sarif', allowEmptyArchive: true
+                }
+            }
+        }
+
         stage('CI') {
             // Run every CI step inside a throwaway node:20-alpine container,
             // started on the linux-build agent (the only node with a Docker CLI
