@@ -21,6 +21,14 @@ pipeline {
             defaultValue: '',
             description: 'Lab 07 only: image to deploy instead of this build\'s image (leave empty)'
         )
+        // Lab 08: Terraform is planned on every build, but only a person can
+        // start an apply: tick this in "Build with Parameters", then approve
+        // the plan at the Approval stage. Webhook builds never apply.
+        booleanParam(
+            name: 'APPLY_INFRA',
+            defaultValue: false,
+            description: 'Lab 08: after the Terraform plan, ask for approval and apply it'
+        )
     }
 
     stages {
@@ -257,6 +265,108 @@ pipeline {
                         error('Policy Gate: build denied by policy/security.rego (see deny messages above)')
                     }
                     echo 'Policy Gate: allowed - no CRITICAL vulnerabilities in the dependency scan'
+                }
+            }
+        }
+
+        stage('IaC Lint & Validate') {
+            // Static checks on the infrastructure code, before any plan: the
+            // Terraform and Ansible halves are independent, so run them in
+            // parallel and stop both as soon as one fails.
+            failFast true
+            parallel {
+                stage('Terraform Validate') {
+                    agent {
+                        docker {
+                            image 'hashicorp/terraform:1.16.4'
+                            label 'linux-build'
+                            // tf_plugin_cache: providers downloaded once, reused by
+                            // every later terraform stage (volume owned by UID 1000).
+                            // TF_DATA_DIR: a private, throwaway .terraform dir, so
+                            // this backend-less validate never picks up the S3
+                            // backend that Terraform Plan initialised in the shared
+                            // workspace (which would demand AWS credentials).
+                            args '--entrypoint= -e HOME=/tmp -e TF_IN_AUTOMATION=1 -e TF_DATA_DIR=/tmp/tf-validate-data -e TF_PLUGIN_CACHE_DIR=/tmp/tf-plugin-cache -v tf_plugin_cache:/tmp/tf-plugin-cache'
+                        }
+                    }
+                    options {
+                        timeout(time: 10, unit: 'MINUTES')
+                    }
+                    steps {
+                        script { env.CURRENT_STAGE = env.STAGE_NAME }
+                        dir('infra/terraform') {
+                            // -backend=false: validation needs the providers,
+                            // not the remote state.
+                            sh 'terraform init -backend=false -input=false'
+                            sh 'terraform validate'
+                            sh 'terraform fmt -check -recursive'
+                        }
+                    }
+                }
+                stage('Ansible Lint') {
+                    agent {
+                        docker {
+                            // ansible-lint 26.1.1 (the image publishes no version
+                            // tags, so it is pinned by digest).
+                            image 'pipelinecomponents/ansible-lint@sha256:a767239e6442051d483a85a6ae1c83973c94c7b684f31d2812d8f616081a87af'
+                            label 'linux-build'
+                            args '--entrypoint= -e HOME=/tmp'
+                        }
+                    }
+                    options {
+                        timeout(time: 10, unit: 'MINUTES')
+                    }
+                    steps {
+                        script { env.CURRENT_STAGE = env.STAGE_NAME }
+                        sh 'ansible-lint infra/ansible/playbook.yml'
+                    }
+                }
+            }
+        }
+
+        stage('IaC Security Scan') {
+            // Misconfiguration scan of the Terraform code with two independent
+            // tools, before any plan. Both always run (so both reports exist);
+            // the stage fails if either reports a finding.
+            agent { label 'linux-build' }
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            environment {
+                TFSEC_IMAGE   = 'aquasec/tfsec:v1.28.14'
+                CHECKOV_IMAGE = 'bridgecrew/checkov:3.3.20'
+            }
+            steps {
+                script {
+                    env.CURRENT_STAGE = env.STAGE_NAME
+                    sh 'mkdir -p reports/iac'
+                    // tfsec: SARIF report (never fails), then the gate run whose
+                    // table goes to the log and whose exit code counts.
+                    sh '''
+                        docker run --rm --volumes-from "$(hostname)" -w "$WORKSPACE" -u "$(id -u):$(id -g)" \
+                          "$TFSEC_IMAGE" infra/terraform --no-color --soft-fail \
+                          --format sarif --out reports/iac/tfsec.sarif
+                    '''
+                    def tfsec = sh(returnStatus: true, script: '''
+                        docker run --rm --volumes-from "$(hostname)" -w "$WORKSPACE" -u "$(id -u):$(id -g)" \
+                          "$TFSEC_IMAGE" infra/terraform --no-color
+                    ''')
+                    // checkov: one run prints to the log and writes SARIF.
+                    def checkov = sh(returnStatus: true, script: '''
+                        docker run --rm --volumes-from "$(hostname)" -w "$WORKSPACE" -u "$(id -u):$(id -g)" \
+                          -e HOME=/tmp "$CHECKOV_IMAGE" -d infra/terraform --framework terraform --compact \
+                          -o cli -o sarif --output-file-path console,reports/iac/checkov.sarif
+                    ''')
+                    echo "IaC Security Scan: tfsec exit=${tfsec}, checkov exit=${checkov}"
+                    if (tfsec != 0 || checkov != 0) {
+                        error('IaC Security Scan: misconfigurations found by tfsec and/or checkov (see reports above)')
+                    }
+                    echo 'IaC Security Scan: no findings from tfsec or checkov'
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/iac/*.sarif', allowEmptyArchive: true
                 }
             }
         }
@@ -521,6 +631,190 @@ pipeline {
             post {
                 always {
                     archiveArtifacts artifacts: 'trivy.sarif', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Terraform Plan') {
+            // Plan the environment (LocalStack + host container) against the
+            // remote S3 state. Read-only: it runs on every branch build and
+            // records what an apply would change.
+            when {
+                beforeAgent true
+                not { changeRequest() }
+            }
+            agent {
+                docker {
+                    image 'hashicorp/terraform:1.16.4'
+                    label 'linux-build'
+                    // --network jenkins: reach http://localstack:4566.
+                    // docker.sock + group 0: the Docker provider builds/starts the
+                    // host container on the host daemon.
+                    args '--entrypoint= --network jenkins --group-add 0 -v /var/run/docker.sock:/var/run/docker.sock -e HOME=/tmp -e TF_IN_AUTOMATION=1 -e TF_PLUGIN_CACHE_DIR=/tmp/tf-plugin-cache -v tf_plugin_cache:/tmp/tf-plugin-cache'
+                }
+            }
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                // LocalStack's dummy keys still live in Jenkins credentials, so the
+                // Jenkinsfile has no literal credentials (Lab 10 checklist).
+                withCredentials([usernamePassword(credentialsId: 'localstack-aws',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    dir('infra/terraform') {
+                        sh 'terraform init -input=false'
+                        script {
+                            // -detailed-exitcode: 0 = no changes, 2 = changes, 1 = error.
+                            // Output goes to plan.log first so the exit code is
+                            // terraform's own (busybox sh has no PIPESTATUS).
+                            def rc = sh(returnStatus: true, script: '''
+                                terraform plan -input=false -no-color -detailed-exitcode -out=tfplan \
+                                  -var "ssh_public_key=$(cat ../ansible/ansible.pub)" > plan.log 2>&1
+                            ''')
+                            sh 'cat plan.log'
+                            if (rc == 1) {
+                                error('Terraform Plan failed (see output above)')
+                            }
+                            env.TF_PLAN_HAS_CHANGES = (rc == 2) ? 'true' : 'false'
+                            env.TF_PLAN_SUMMARY = sh(
+                                script: "grep -E '^(Plan:|No changes)' plan.log | head -1",
+                                returnStdout: true
+                            ).trim()
+                            echo "Terraform plan summary: ${env.TF_PLAN_SUMMARY}"
+                        }
+                        sh 'terraform show -no-color tfplan > tfplan.txt'
+                        stash name: 'tfplan', includes: 'tfplan'
+                    }
+                }
+            }
+            post {
+                always {
+                    // The binary plan (what Apply will execute) and a readable copy.
+                    archiveArtifacts artifacts: 'infra/terraform/tfplan, infra/terraform/tfplan.txt', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Approval') {
+            // A person must approve the exact plan above. No agent: waiting for
+            // the click does not hold linux-build's executor.
+            when {
+                beforeAgent true
+                allOf {
+                    not { changeRequest() }
+                    expression { params.APPLY_INFRA }
+                    environment name: 'TF_PLAN_HAS_CHANGES', value: 'true'
+                }
+            }
+            options {
+                timeout(time: 30, unit: 'MINUTES')
+            }
+            steps {
+                script {
+                    env.CURRENT_STAGE = env.STAGE_NAME
+                    input(
+                        message: "Apply this Terraform plan?\n\n${env.TF_PLAN_SUMMARY}\n\nFull plan: ${env.BUILD_URL}artifact/infra/terraform/tfplan.txt",
+                        ok: 'Apply',
+                        submitter: 'admin'
+                    )
+                }
+            }
+        }
+
+        stage('Terraform Apply') {
+            // Applies exactly the approved plan file; if the state moved since
+            // the plan, Terraform refuses the stale plan instead of guessing.
+            // Also runs (without applying) when the plan had no changes, so the
+            // outputs and the Ansible inventory are always produced.
+            when {
+                beforeAgent true
+                allOf {
+                    not { changeRequest() }
+                    expression { params.APPLY_INFRA }
+                }
+            }
+            agent {
+                docker {
+                    image 'hashicorp/terraform:1.16.4'
+                    label 'linux-build'
+                    args '--entrypoint= --network jenkins --group-add 0 -v /var/run/docker.sock:/var/run/docker.sock -e HOME=/tmp -e TF_IN_AUTOMATION=1 -e TF_PLUGIN_CACHE_DIR=/tmp/tf-plugin-cache -v tf_plugin_cache:/tmp/tf-plugin-cache'
+                }
+            }
+            options {
+                timeout(time: 15, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                withCredentials([usernamePassword(credentialsId: 'localstack-aws',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    dir('infra/terraform') {
+                        unstash 'tfplan'
+                        sh 'terraform init -input=false'
+                        script {
+                            if (env.TF_PLAN_HAS_CHANGES == 'true') {
+                                sh 'terraform apply -input=false -no-color tfplan'
+                            } else {
+                                echo 'Plan had no changes - nothing to apply'
+                            }
+                        }
+                        sh 'terraform output -no-color'
+                        sh 'terraform output -json > outputs.json'
+                        // Dynamic Ansible inventory, generated from Terraform's
+                        // outputs on every run (the host address is not fixed).
+                        sh '''
+                            printf '[app]\\n%s ansible_host=%s ansible_user=ansible\\n' \
+                              "$(terraform output -raw instance_hostname)" \
+                              "$(terraform output -raw instance_address)" > ../ansible/inventory.ini
+                            cat ../ansible/inventory.ini
+                        '''
+                    }
+                    stash name: 'ansible-inventory', includes: 'infra/ansible/inventory.ini'
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'infra/terraform/outputs.json, infra/ansible/inventory.ini', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Configure with Ansible') {
+            // Configure the host Terraform just provisioned: Node.js, Docker,
+            // and this build's scanned API image (by commit tag).
+            when {
+                beforeAgent true
+                allOf {
+                    not { changeRequest() }
+                    expression { params.APPLY_INFRA }
+                }
+            }
+            agent {
+                docker {
+                    image 'alpine/ansible:2.21.0'
+                    label 'linux-build'
+                    // -u 0:0: the SSH client refuses to run for a UID with no
+                    // passwd entry (the agent's 1000 is unknown in this image).
+                    // --network jenkins: reach the host container by address.
+                    args '--entrypoint= -u 0:0 --network jenkins -e HOME=/tmp -e ANSIBLE_HOST_KEY_CHECKING=False -e ANSIBLE_FORCE_COLOR=0'
+                }
+            }
+            options {
+                timeout(time: 20, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                unstash 'ansible-inventory'
+                // The private key lives only in Jenkins credentials; the host
+                // trusts its public half (infra/ansible/ansible.pub via Terraform).
+                withCredentials([sshUserPrivateKey(credentialsId: 'ansible-ssh',
+                        keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
+                    sh '''
+                        ansible-playbook -i infra/ansible/inventory.ini \
+                          --private-key "$SSH_KEY" -u "$SSH_USER" \
+                          -e app_image="registry:5000/poonsuk-api:$IMAGE_TAG" \
+                          infra/ansible/playbook.yml
+                    '''
                 }
             }
         }
