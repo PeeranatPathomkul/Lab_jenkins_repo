@@ -1,0 +1,8 @@
+# State lives in the remote S3 backend — never commit local state or plans.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+# .terraform.lock.hcl IS committed (pins provider versions/checksums).
