@@ -21,6 +21,14 @@ pipeline {
             defaultValue: '',
             description: 'Lab 07 only: image to deploy instead of this build\'s image (leave empty)'
         )
+        // Lab 08: Terraform is planned on every build, but only a person can
+        // start an apply: tick this in "Build with Parameters", then approve
+        // the plan at the Approval stage. Webhook builds never apply.
+        booleanParam(
+            name: 'APPLY_INFRA',
+            defaultValue: false,
+            description: 'Lab 08: after the Terraform plan, ask for approval and apply it'
+        )
     }
 
     stages {
@@ -619,6 +627,134 @@ pipeline {
             post {
                 always {
                     archiveArtifacts artifacts: 'trivy.sarif', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Terraform Plan') {
+            // Plan the environment (LocalStack + host container) against the
+            // remote S3 state. Read-only: it runs on every branch build and
+            // records what an apply would change.
+            when {
+                beforeAgent true
+                not { changeRequest() }
+            }
+            agent {
+                docker {
+                    image 'hashicorp/terraform:1.16.4'
+                    label 'linux-build'
+                    // --network jenkins: reach http://localstack:4566.
+                    // docker.sock + group 0: the Docker provider builds/starts the
+                    // host container on the host daemon.
+                    args '--entrypoint= --network jenkins --group-add 0 -v /var/run/docker.sock:/var/run/docker.sock -e HOME=/tmp -e TF_IN_AUTOMATION=1 -e TF_PLUGIN_CACHE_DIR=/tmp/tf-plugin-cache -v tf_plugin_cache:/tmp/tf-plugin-cache'
+                }
+            }
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                // LocalStack's dummy keys still live in Jenkins credentials, so the
+                // Jenkinsfile has no literal credentials (Lab 10 checklist).
+                withCredentials([usernamePassword(credentialsId: 'localstack-aws',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    dir('infra/terraform') {
+                        sh 'terraform init -input=false'
+                        script {
+                            // -detailed-exitcode: 0 = no changes, 2 = changes, 1 = error.
+                            // Output goes to plan.log first so the exit code is
+                            // terraform's own (busybox sh has no PIPESTATUS).
+                            def rc = sh(returnStatus: true, script: '''
+                                terraform plan -input=false -no-color -detailed-exitcode -out=tfplan \
+                                  -var "ssh_public_key=$(cat ../ansible/ansible.pub)" > plan.log 2>&1
+                            ''')
+                            sh 'cat plan.log'
+                            if (rc == 1) {
+                                error('Terraform Plan failed (see output above)')
+                            }
+                            env.TF_PLAN_HAS_CHANGES = (rc == 2) ? 'true' : 'false'
+                            env.TF_PLAN_SUMMARY = sh(
+                                script: "grep -E '^(Plan:|No changes)' plan.log | head -1",
+                                returnStdout: true
+                            ).trim()
+                            echo "Terraform plan summary: ${env.TF_PLAN_SUMMARY}"
+                        }
+                        sh 'terraform show -no-color tfplan > tfplan.txt'
+                        stash name: 'tfplan', includes: 'tfplan'
+                    }
+                }
+            }
+            post {
+                always {
+                    // The binary plan (what Apply will execute) and a readable copy.
+                    archiveArtifacts artifacts: 'infra/terraform/tfplan, infra/terraform/tfplan.txt', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Approval') {
+            // A person must approve the exact plan above. No agent: waiting for
+            // the click does not hold linux-build's executor.
+            when {
+                beforeAgent true
+                allOf {
+                    not { changeRequest() }
+                    expression { params.APPLY_INFRA }
+                    environment name: 'TF_PLAN_HAS_CHANGES', value: 'true'
+                }
+            }
+            options {
+                timeout(time: 30, unit: 'MINUTES')
+            }
+            steps {
+                script {
+                    env.CURRENT_STAGE = env.STAGE_NAME
+                    input(
+                        message: "Apply this Terraform plan?\n\n${env.TF_PLAN_SUMMARY}\n\nFull plan: ${env.BUILD_URL}artifact/infra/terraform/tfplan.txt",
+                        ok: 'Apply',
+                        submitter: 'admin'
+                    )
+                }
+            }
+        }
+
+        stage('Terraform Apply') {
+            // Applies exactly the approved plan file; if the state moved since
+            // the plan, Terraform refuses the stale plan instead of guessing.
+            when {
+                beforeAgent true
+                allOf {
+                    not { changeRequest() }
+                    expression { params.APPLY_INFRA }
+                    environment name: 'TF_PLAN_HAS_CHANGES', value: 'true'
+                }
+            }
+            agent {
+                docker {
+                    image 'hashicorp/terraform:1.16.4'
+                    label 'linux-build'
+                    args '--entrypoint= --network jenkins --group-add 0 -v /var/run/docker.sock:/var/run/docker.sock -e HOME=/tmp -e TF_IN_AUTOMATION=1 -e TF_PLUGIN_CACHE_DIR=/tmp/tf-plugin-cache -v tf_plugin_cache:/tmp/tf-plugin-cache'
+                }
+            }
+            options {
+                timeout(time: 15, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                withCredentials([usernamePassword(credentialsId: 'localstack-aws',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    dir('infra/terraform') {
+                        unstash 'tfplan'
+                        sh 'terraform init -input=false'
+                        sh 'terraform apply -input=false -no-color tfplan'
+                        sh 'terraform output -no-color'
+                        sh 'terraform output -json > outputs.json'
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'infra/terraform/outputs.json', allowEmptyArchive: true
                 }
             }
         }

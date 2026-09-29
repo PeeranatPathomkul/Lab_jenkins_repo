@@ -4,5 +4,8 @@
 *.tfstate.*
 *.tfplan
 tfplan
+tfplan.txt
+plan.log
+outputs.json
 crash.log
 # .terraform.lock.hcl IS committed (pins provider versions/checksums).
