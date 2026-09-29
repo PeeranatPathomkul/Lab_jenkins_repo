@@ -261,6 +261,57 @@ pipeline {
             }
         }
 
+        stage('IaC Lint & Validate') {
+            // Static checks on the infrastructure code, before any plan: the
+            // Terraform and Ansible halves are independent, so run them in
+            // parallel and stop both as soon as one fails.
+            failFast true
+            parallel {
+                stage('Terraform Validate') {
+                    agent {
+                        docker {
+                            image 'hashicorp/terraform:1.16.4'
+                            label 'linux-build'
+                            // tf_plugin_cache: providers downloaded once, reused by
+                            // every later terraform stage (volume owned by UID 1000).
+                            args '--entrypoint= -e HOME=/tmp -e TF_IN_AUTOMATION=1 -e TF_PLUGIN_CACHE_DIR=/tmp/tf-plugin-cache -v tf_plugin_cache:/tmp/tf-plugin-cache'
+                        }
+                    }
+                    options {
+                        timeout(time: 10, unit: 'MINUTES')
+                    }
+                    steps {
+                        script { env.CURRENT_STAGE = env.STAGE_NAME }
+                        dir('infra/terraform') {
+                            // -backend=false: validation needs the providers,
+                            // not the remote state.
+                            sh 'terraform init -backend=false -input=false'
+                            sh 'terraform validate'
+                            sh 'terraform fmt -check -recursive'
+                        }
+                    }
+                }
+                stage('Ansible Lint') {
+                    agent {
+                        docker {
+                            // ansible-lint 26.1.1 (the image publishes no version
+                            // tags, so it is pinned by digest).
+                            image 'pipelinecomponents/ansible-lint@sha256:a767239e6442051d483a85a6ae1c83973c94c7b684f31d2812d8f616081a87af'
+                            label 'linux-build'
+                            args '--entrypoint= -e HOME=/tmp'
+                        }
+                    }
+                    options {
+                        timeout(time: 10, unit: 'MINUTES')
+                    }
+                    steps {
+                        script { env.CURRENT_STAGE = env.STAGE_NAME }
+                        sh 'ansible-lint infra/ansible/playbook.yml'
+                    }
+                }
+            }
+        }
+
         stage('CI') {
             // Run every CI step inside a throwaway node:20-alpine container,
             // started on the linux-build agent (the only node with a Docker CLI
