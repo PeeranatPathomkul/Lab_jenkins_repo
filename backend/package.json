@@ -95,5 +95,9 @@
   "jest-junit": {
     "outputDirectory": "reports",
     "outputName": "junit.xml"
+  },
+  "overrides": {
+    "multer": "^2.3.0",
+    "lodash": "^4.18.0"
   }
 }
