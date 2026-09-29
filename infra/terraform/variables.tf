@@ -11,9 +11,11 @@ variable "localstack_endpoint" {
 }
 
 variable "ami_id" {
-  description = "AMI for the (mock) EC2 instance; any ID LocalStack accepts."
+  # Must exist in LocalStack's built-in image catalogue: with root_block_device
+  # set, the provider calls DescribeImages to find the root device name.
+  description = "AMI for the (mock) EC2 instance (Ubuntu image from LocalStack's catalogue)."
   type        = string
-  default     = "ami-df5de72bdb3b"
+  default     = "ami-785db401"
 }
 
 variable "instance_type" {
@@ -26,6 +28,12 @@ variable "app_port" {
   description = "Port the API is served on; the only port the security group opens."
   type        = number
   default     = 8080
+}
+
+variable "allowed_cidr" {
+  description = "Network allowed to reach the app port (the private network in front of the host, not the internet)."
+  type        = string
+  default     = "10.0.0.0/16"
 }
 
 variable "ssh_public_key" {
