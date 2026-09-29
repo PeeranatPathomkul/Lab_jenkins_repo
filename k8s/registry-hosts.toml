@@ -1,0 +1,5 @@
+# containerd mirror for the kind node (Lab 07): image names use
+# localhost:5000/... (what the host Docker daemon pushed), and inside the kind
+# network the registry container answers as http://registry:5000.
+# Copied to /etc/containerd/certs.d/localhost:5000/hosts.toml on the node.
+[host."http://registry:5000"]

@@ -15,4 +15,9 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 COPY --from=docker /usr/local/bin/docker /usr/local/bin/docker
 # Lab 05 — the E2E stage starts the API with `docker compose`.
 COPY --from=docker /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
+# Lab 07 — the Blue/Green Deploy stage drives the kind cluster with kubectl
+# (same minor version as the cluster's Kubernetes).
+ARG KUBECTL_VERSION=v1.37.0
+RUN curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+ && chmod +x /usr/local/bin/kubectl
 USER jenkins

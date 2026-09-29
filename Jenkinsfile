@@ -11,6 +11,18 @@ pipeline {
         NODE_ENV = 'test'
     }
 
+    parameters {
+        // Lab 07 fault injection: deploy a known-broken image to prove the
+        // automatic blue/green rollback. Empty (the default, and what every
+        // webhook-triggered build uses) deploys the image this run built and
+        // scanned. Never set it outside the lab: it bypasses the Trivy gate.
+        string(
+            name: 'DEPLOY_IMAGE_OVERRIDE',
+            defaultValue: '',
+            description: 'Lab 07 only: image to deploy instead of this build\'s image (leave empty)'
+        )
+    }
+
     stages {
         stage('Secrets Detection') {
             // Shift-left: the first gate, before anything is installed or built.
@@ -359,7 +371,9 @@ pipeline {
                     sh '$COMPOSE down -v --remove-orphans || true'
                     sh '$COMPOSE build api'
                     sh '$COMPOSE up -d --wait postgres redis'
-                    sh '$COMPOSE run --rm --no-deps api npx typeorm migration:run -d dist/config/data-source.js'
+                    // The production image ships without npm/npx (Lab 07), so
+                    // call the TypeORM CLI with node directly.
+                    sh '$COMPOSE run --rm --no-deps api node node_modules/typeorm/cli.js migration:run -d dist/config/data-source.js'
                     sh '$COMPOSE run --rm --no-deps api node dist/database/seed-users.js'
                     sh '$COMPOSE run --rm --no-deps api node dist/database/seed-rooms.js'
                     sh '$COMPOSE up -d --wait api'
@@ -438,6 +452,154 @@ pipeline {
                 script { env.CURRENT_STAGE = env.STAGE_NAME }
                 timeout(time: 5, unit: 'MINUTES') {
                     waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Build Image') {
+            // Package the API that passed every gate above into an immutable,
+            // commit-tagged image in the local registry. Never `latest`: a tag
+            // must always mean the same bits, so a deploy or rollback is exact.
+            agent { label 'linux-build' }
+            options {
+                timeout(time: 15, unit: 'MINUTES')
+            }
+            steps {
+                script {
+                    env.CURRENT_STAGE = env.STAGE_NAME
+                    // The host's Docker daemon pushes to the registry container
+                    // through its published port, so the image name uses
+                    // localhost:5000. Later stages reuse IMAGE / IMAGE_TAG.
+                    env.REGISTRY = 'localhost:5000'
+                    env.IMAGE_TAG = env.GIT_COMMIT.take(7)
+                    env.IMAGE = "${env.REGISTRY}/poonsuk-api:${env.IMAGE_TAG}"
+                }
+                sh '''
+                    # Immutability: a commit's tag is pushed once and never
+                    # overwritten; a re-run of the same commit reuses it.
+                    if docker manifest inspect --insecure "$IMAGE" > /dev/null 2>&1; then
+                        echo "$IMAGE already in the registry - not rebuilding or overwriting it"
+                        exit 0
+                    fi
+                    docker build --target production \
+                      --label org.opencontainers.image.revision="$GIT_COMMIT" \
+                      --label org.opencontainers.image.source="$GIT_URL" \
+                      -t "$IMAGE" backend
+                    docker push "$IMAGE"
+                '''
+                // Show what the registry now holds for this repository.
+                sh 'curl -s http://registry:5000/v2/poonsuk-api/tags/list; echo'
+            }
+        }
+
+        stage('Container Scan') {
+            // Scan the exact image that was just pushed (by its commit tag), OS
+            // packages and node_modules alike, before anything deploys it.
+            agent {
+                docker {
+                    image 'aquasec/trivy:0.74.0'
+                    label 'linux-build'
+                    // --network jenkins: pull from http://registry:5000.
+                    // trivy_cache: keep the vulnerability DB between builds
+                    // (volume owned by the agent UID 1000).
+                    args '--entrypoint= --network jenkins -v trivy_cache:/tmp/trivy-cache -e TRIVY_CACHE_DIR=/tmp/trivy-cache -e TRIVY_INSECURE=true'
+                }
+            }
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                // 1) SARIF report, always written (exit 0), so it can be
+                //    archived whether or not the gate below passes.
+                sh 'trivy image --scanners vuln --severity HIGH,CRITICAL --format sarif --output trivy.sarif "registry:5000/poonsuk-api:$IMAGE_TAG"'
+                // 2) The gate: any HIGH or CRITICAL finding exits 1 and fails the
+                //    build before deployment. Same scan (DB is cached), printed
+                //    as a table for the log.
+                sh 'trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --format table "registry:5000/poonsuk-api:$IMAGE_TAG"'
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy.sarif', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Blue/Green Deploy') {
+            // Deploy the scanned image to the idle colour in the kind cluster,
+            // smoke-test it there, then flip the live Service's selector.
+            // Lab scope: runs for every branch build (not PR builds) against the
+            // single local cluster; a real pipeline would limit this to main.
+            when {
+                beforeAgent true
+                not { changeRequest() }
+            }
+            agent { label 'linux-build' }
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                // kubeconfig for the kind cluster (API server reached over the
+                // `kind` Docker network) comes only from Jenkins credentials.
+                withCredentials([file(credentialsId: 'kubeconfig-kind', variable: 'KUBECONFIG')]) {
+                    script {
+                        def current = sh(
+                            script: "kubectl get svc taskflow -o jsonpath='{.spec.selector.color}'",
+                            returnStdout: true
+                        ).trim()
+                        def next = current == 'blue' ? 'green' : 'blue'
+                        // Remembered for the automatic rollback in post.failure.
+                        env.BG_PREVIOUS = current
+                        env.BG_NEXT = next
+
+                        def override = params.DEPLOY_IMAGE_OVERRIDE?.trim()
+                        def image = override ?: env.IMAGE
+                        if (override) {
+                            echo "FAULT INJECTION: deploying ${override} instead of ${env.IMAGE}"
+                        }
+                        echo "Live colour: ${current}. Deploying ${image} to ${next}."
+
+                        // Service before the switch (Lab 07 deliverable).
+                        sh 'kubectl get svc taskflow -o yaml'
+
+                        sh "kubectl set image deployment/taskflow-${next} app=${image}"
+                        sh "kubectl rollout status deployment/taskflow-${next} --timeout=120s"
+
+                        // Smoke test the new pods directly through their own
+                        // Service (taskflow-<colour>), bypassing the live one.
+                        sh "kubectl run smoke-${env.IMAGE_TAG}-${env.BUILD_NUMBER} --rm -i --restart=Never --image=curlimages/curl -- curl -sf http://taskflow-${next}:8080/health"
+
+                        sh """kubectl patch svc taskflow -p '{"spec":{"selector":{"color":"${next}"}}}'"""
+                        echo "Switched traffic from ${current} to ${next}"
+
+                        // Service after the switch (Lab 07 deliverable).
+                        sh 'kubectl get svc taskflow -o yaml'
+                    }
+                }
+            }
+            post {
+                failure {
+                    // Automatic rollback: whatever step failed (rollout, smoke
+                    // test, the switch itself), point the live Service back at
+                    // the colour that was serving before this build. Patching an
+                    // unchanged selector is a no-op, so this is always safe.
+                    withCredentials([file(credentialsId: 'kubeconfig-kind', variable: 'KUBECONFIG')]) {
+                        script {
+                            if (env.BG_PREVIOUS) {
+                                echo "ROLLBACK: deploy to ${env.BG_NEXT} failed - routing traffic back to ${env.BG_PREVIOUS}"
+                                sh """kubectl patch svc taskflow -p '{"spec":{"selector":{"color":"${env.BG_PREVIOUS}"}}}'"""
+                                // Also return the idle colour to its last good
+                                // image, so the next deploy starts from a healthy
+                                // standby instead of a crash-looping one.
+                                sh "kubectl rollout undo deployment/taskflow-${env.BG_NEXT} || true"
+                                sh 'kubectl get svc taskflow -o yaml'
+                                echo "ROLLBACK complete: live colour is ${env.BG_PREVIOUS}"
+                            } else {
+                                echo 'ROLLBACK: failed before the live colour was read - nothing to roll back'
+                            }
+                        }
+                    }
                 }
             }
         }
