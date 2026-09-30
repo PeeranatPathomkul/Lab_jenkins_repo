@@ -35,6 +35,10 @@ class Room {
   List<String> amenities;
   RoomStatus status;
 
+  /// Nightly price per guest at full occupancy, as computed by the API
+  /// (`pricePerGuest`). Null for rooms that did not come from the API.
+  double? pricePerGuest;
+
   Room({
     required this.id,
     required this.name,
@@ -45,6 +49,7 @@ class Room {
     required this.imageUrls,
     required this.amenities,
     this.status = RoomStatus.available,
+    this.pricePerGuest,
   });
 
   String get primaryImage =>

@@ -122,6 +122,7 @@ Room roomFromJson(Map<String, dynamic> json) {
     // `num` covers the case where it arrives as an int (e.g. 2500 not 2500.0).
     pricePerNight: (json['pricePerNight'] as num).toDouble(),
     capacity: (json['capacity'] as num).toInt(),
+    pricePerGuest: (json['pricePerGuest'] as num?)?.toDouble(),
     description: (json['description'] as String?) ?? '',
     imageUrls: ((json['imageUrls'] as List<dynamic>?) ?? const [])
         .map((e) => e as String)

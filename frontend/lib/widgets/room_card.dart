@@ -70,6 +70,15 @@ class RoomCard extends StatelessWidget {
                       Text(' / night',
                           style: TextStyle(color: Colors.grey.shade600)),
                       const Spacer(),
+                      if (room.pricePerGuest != null)
+                        Padding(
+                          padding: const EdgeInsets.only(right: 8),
+                          child: Text(
+                            '${Format.money(room.pricePerGuest!)} / guest',
+                            style: TextStyle(
+                                color: Colors.grey.shade600, fontSize: 12),
+                          ),
+                        ),
                       const Icon(Icons.arrow_forward_ios, size: 14),
                     ],
                   ),

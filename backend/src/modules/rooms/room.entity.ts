@@ -1,5 +1,6 @@
 import {
-  Column, CreateDateColumn, Entity, Index, OneToMany, PrimaryGeneratedColumn, UpdateDateColumn,
+  AfterLoad, Column, CreateDateColumn, Entity, Index, OneToMany, PrimaryGeneratedColumn,
+  UpdateDateColumn,
 } from 'typeorm';
 import { numericTransformer } from '../../common/numeric.transformer';
 import { Booking } from '../bookings/booking.entity';
@@ -62,4 +63,17 @@ export class Room {
 
   @UpdateDateColumn({ name: 'updated_at', type: 'timestamptz' })
   updatedAt!: Date;
+
+  /**
+   * Nightly price per guest when the room is full (pricePerNight / capacity,
+   * rounded to 2 decimals). Derived, not stored: sent in every room response
+   * so the mobile app can show it without doing the maths itself.
+   */
+  pricePerGuest?: number;
+
+  @AfterLoad()
+  computePricePerGuest(): void {
+    this.pricePerGuest =
+      this.capacity > 0 ? this.pricePerNight / this.capacity : undefined;
+  }
 }
