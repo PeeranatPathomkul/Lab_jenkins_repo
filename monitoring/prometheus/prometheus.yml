@@ -1,0 +1,12 @@
+# Lab 09: Prometheus scraping Jenkins' own metrics (Prometheus metrics plugin).
+# Runs as container `prometheus` on the `jenkins` Docker network.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: jenkins
+    # The plugin serves on <jenkins-url>/prometheus/ (trailing slash matters).
+    metrics_path: /prometheus/
+    static_configs:
+      - targets: ["jenkins:8080"]
