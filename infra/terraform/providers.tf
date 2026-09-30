@@ -25,7 +25,8 @@ provider "aws" {
 
 # LocalStack community EC2 is a mock (no real VM). The Docker provider creates
 # the real machine Ansible configures: a container that stands in for the
-# instance (see main.tf). Talks to the host Docker daemon via the socket.
+# instance (see main.tf). Talks to the host Docker daemon: via the socket
+# locally, via the docker-proxy service from the Jenkins Kubernetes pods.
 provider "docker" {
-  host = "unix:///var/run/docker.sock"
+  host = var.docker_host
 }

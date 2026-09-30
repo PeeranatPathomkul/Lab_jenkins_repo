@@ -1,0 +1,14 @@
+# Pod for Configure with Ansible. Runs as the image's root user (the SSH
+# client needs a real passwd entry) and reaches the Terraform-created host
+# over the kind network.
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: ansible
+      image: alpine/ansible:2.21.0
+      command: ["cat"]
+      tty: true
+      env:
+        - { name: ANSIBLE_HOST_KEY_CHECKING, value: "False" }
+        - { name: ANSIBLE_FORCE_COLOR, value: "0" }

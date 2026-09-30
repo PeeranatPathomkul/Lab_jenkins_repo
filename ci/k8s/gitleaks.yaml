@@ -1,0 +1,18 @@
+# Pod for the Secrets Detection stage (Lab 10: every stage runs on a
+# Kubernetes dynamic agent in the kind cluster). The Kubernetes plugin adds the
+# `jnlp` agent container; steps run in the containers below via container().
+# UID 1000 everywhere, like the jnlp container that checks the workspace out,
+# so git does not reject the repository as "dubious ownership".
+apiVersion: v1
+kind: Pod
+spec:
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+  containers:
+    - name: gitleaks
+      image: zricethezav/gitleaks:v8.30.1
+      command: ["cat"]
+      tty: true
+      env:
+        - { name: HOME, value: /tmp }

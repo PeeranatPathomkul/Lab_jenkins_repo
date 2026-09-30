@@ -1,0 +1,50 @@
+# Unit tests for alerts.yml:
+#   promtool test rules /etc/prometheus/alerts_test.yml
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 15s
+
+tests:
+  # Builds keep waiting for 8 minutes: the alert must be pending first, then
+  # firing once the queue has been non-empty for 2m + 5m.
+  - interval: 15s
+    input_series:
+      - series: jenkins_queue_buildable_value
+        values: "0 3x40"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: JenkinsQueueBacklog
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: JenkinsQueueBacklog
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Jenkins build queue wait exceeds 2 minutes"
+              description: >-
+                3 build(s) have been waiting for an executor for more than 2 minutes, continuously for 5 minutes. Pipeline capacity is too low (e.g. the Kubernetes cloud / pod template concurrency limit).
+
+  # Short blips (a pod starting, a build queued for a few seconds) must never
+  # alert: the queue empties every minute.
+  - interval: 15s
+    input_series:
+      - series: jenkins_queue_buildable_value
+        values: "1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0 0"
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: JenkinsQueueBacklog
+        exp_alerts: []
+
+  # SLI recording rules: p95 of 400 s is out of the 6-minute target.
+  - interval: 1m
+    input_series:
+      - series: 'jenkins_job_building_duration{quantile="0.95"}'
+        values: "400x5"
+    promql_expr_test:
+      - expr: jenkins:build_duration_p95_within_slo:bool
+        eval_time: 2m
+        exp_samples:
+          - labels: 'jenkins:build_duration_p95_within_slo:bool'
+            value: 0

@@ -42,7 +42,13 @@ variable "ssh_public_key" {
 }
 
 variable "host_network" {
-  description = "Docker network the host container joins, so Jenkins/Ansible can reach it."
+  description = "Docker network the host container joins, so Jenkins/Ansible can reach it (CI on Kubernetes agents: kind)."
   type        = string
   default     = "jenkins"
+}
+
+variable "docker_host" {
+  description = "Docker API the Docker provider talks to. CI pods have no socket and use the docker-proxy service on the kind network."
+  type        = string
+  default     = "unix:///var/run/docker.sock"
 }

@@ -19,7 +19,10 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 version: 1.0.0+1
 
 environment:
-  sdk: ^3.12.2
+  # ^3.12.0, not ^3.12.2: CI builds in ghcr.io/cirruslabs/flutter:3.44.0 (the
+  # image's current `stable`), which ships Dart 3.12.0. Nothing here needs a
+  # 3.12 patch release.
+  sdk: ^3.12.0
 
 # Dependencies specify other packages that your package needs in order to work.
 # To automatically upgrade your package dependencies to the latest versions

@@ -1,0 +1,10 @@
+# Pod for Blue/Green Deploy and the Pipeline Health Gate: kubectl for the
+# cluster, curl + jq for the Prometheus HTTP API.
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: kubectl
+      image: alpine/k8s:1.37.1
+      command: ["cat"]
+      tty: true

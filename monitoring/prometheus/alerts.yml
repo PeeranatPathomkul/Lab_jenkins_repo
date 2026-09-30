@@ -1,0 +1,44 @@
+# Lab 09: SLO and alerting for the CI/CD pipeline itself.
+#
+# SLO: 95% of builds complete in under 6 minutes, over a rolling 7 days.
+#
+# SLI source: the Prometheus metrics plugin exposes build time as a summary
+# with pre-computed quantiles (jenkins_job_building_duration, seconds, over
+# recent builds), not as a histogram with buckets, so "% of builds under 6 min"
+# cannot be counted exactly. The SLI is therefore sampled: every evaluation
+# records whether the current p95 build time is within 6 minutes, and the SLO
+# is the share of good samples over the last 7 days (target >= 95%).
+groups:
+  - name: jenkins-slo
+    rules:
+      # p95 build time across all jobs, in seconds.
+      - record: jenkins:build_duration_p95:seconds
+        expr: max(jenkins_job_building_duration{quantile="0.95"})
+
+      # 1 when the p95 is within the 6-minute target, 0 when it is not.
+      - record: jenkins:build_duration_p95_within_slo:bool
+        expr: jenkins:build_duration_p95:seconds <= bool 360
+
+      # SLO compliance over the rolling 7-day window (target: >= 0.95).
+      - record: jenkins:build_duration_slo:ratio_7d
+        expr: avg_over_time(jenkins:build_duration_p95_within_slo:bool[7d])
+
+      # Symptom alert: work is waiting for build capacity.
+      #
+      # jenkins_queue_buildable_value counts queue items that are ready to run
+      # but have no executor/pod to run on (blocked items, e.g. waiting for an
+      # earlier build of the same job, are excluded). If it has not dropped to
+      # zero at any point in the last 2 minutes, at least one build has been
+      # waiting > 2 minutes; `for: 5m` requires that to hold for 5 minutes
+      # straight. It says nothing about CPU/RAM — it measures what users feel.
+      - alert: JenkinsQueueBacklog
+        expr: min_over_time(jenkins_queue_buildable_value[2m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Jenkins build queue wait exceeds 2 minutes"
+          description: >-
+            {{ $value }} build(s) have been waiting for an executor for more than
+            2 minutes, continuously for 5 minutes. Pipeline capacity is too low
+            (e.g. the Kubernetes cloud / pod template concurrency limit).

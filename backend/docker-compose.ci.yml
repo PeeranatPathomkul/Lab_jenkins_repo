@@ -1,4 +1,6 @@
-# CI overrides for the Jenkinsfile's E2E stage (Lab 05). Used as:
+# Overrides for running the E2E suite with Docker Compose (Lab 05). Since
+# Lab 10 the Jenkinsfile runs E2E in a Kubernetes pod instead; this file stays
+# for running the same setup locally:
 #   docker compose -p poonsuk-e2e -f docker-compose.yml -f docker-compose.ci.yml ...
 #
 # - No host port mappings: the Playwright container reaches the API over the

@@ -25,11 +25,27 @@ android {
         versionName = flutter.versionName
     }
 
+    // Release signing (Lab 10). The upload keystore is never in the repo: the
+    // Jenkins "Release AAB" stage binds it from credentials and passes it in
+    // through these environment variables. Without them (e.g. a local
+    // `flutter run --release`) the release build falls back to the debug key;
+    // the pipeline checks the AAB's certificate so that can never ship.
+    val releaseKeystore = System.getenv("ANDROID_KEYSTORE_PATH")
+    signingConfigs {
+        if (releaseKeystore != null) {
+            create("release") {
+                storeFile = file(releaseKeystore)
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                // PKCS12 keystores use one password for the store and the key.
+                keyPassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName(if (releaseKeystore != null) "release" else "debug")
         }
     }
 }
