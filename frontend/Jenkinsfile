@@ -1,0 +1,216 @@
+// Lab 10: pipeline for the Flutter client (hotel_booking - the manual's
+// taskflow-mobile). Runs as its own multibranch job, `taskflow-mobile`, with
+// Script Path frontend/Jenkinsfile; the API keeps the root Jenkinsfile.
+pipeline {
+    // One Flutter container for the whole build: `flutter pub get` and the
+    // Gradle daemon are paid for once, and Analyze / Unit Test share them.
+    agent {
+        docker {
+            // ghcr.io/cirruslabs/flutter:stable is 3.44.0 today (same digest);
+            // pinned so a new `stable` cannot silently change the toolchain.
+            image 'ghcr.io/cirruslabs/flutter:3.44.0'
+            label 'linux-build'
+            // -u 0:0: the SDK (/sdks/flutter, /opt/android-sdk-linux) belongs
+            // to root, and Flutter/Gradle write into it (tool lock, NDK).
+            // Named volumes keep the pub cache, Gradle caches and the NDK
+            // between builds instead of downloading them every time.
+            args '-u 0:0 -e HOME=/root -v flutter_pub_cache:/root/.pub-cache -v flutter_gradle:/root/.gradle -v android_ndk:/opt/android-sdk-linux/ndk'
+        }
+    }
+
+    environment {
+        APP_NAME = 'hotel_booking'
+    }
+
+    options {
+        // Nothing here waits for a person, so the whole run is bounded. A cold
+        // run (empty caches: Gradle, Android deps, NDK) takes ~15-20 minutes.
+        timeout(time: 45, unit: 'MINUTES')
+    }
+
+    stages {
+        stage('Setup') {
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                sh 'flutter --version'
+                // android/gradle.properties asks for an 8 GB Gradle heap; this
+                // Docker host has ~7.6 GB for everything (Jenkins, SonarQube,
+                // kind...), and a release build with 3 GB + a separate Kotlin
+                // daemon ran it out of memory. GRADLE_USER_HOME settings win over
+                // the project's, so CI caps the build here - one 2 GB JVM,
+                // Kotlin compiled inside it, two workers - without changing what
+                // developers get locally.
+                sh '''
+                    cat > "$HOME/.gradle/gradle.properties" <<'EOF'
+org.gradle.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=768m
+org.gradle.workers.max=2
+kotlin.compiler.execution.strategy=in-process
+EOF
+                '''
+                dir('frontend') {
+                    // Like `npm ci`: install exactly pubspec.lock, fail if it is
+                    // out of date instead of silently resolving new versions.
+                    sh 'flutter pub get --enforce-lockfile'
+                }
+            }
+        }
+
+        stage('Verify') {
+            // Independent checks side by side; the first failure aborts the
+            // rest (same pattern as the API pipeline). Branches record
+            // CURRENT_STAGE only when they fail.
+            failFast true
+            parallel {
+                stage('Analyze') {
+                    options {
+                        // ~10 s normally. The analysis server once spun for 20+
+                        // minutes while the Docker VM was swapping; fail fast
+                        // instead of holding the build until the global timeout.
+                        timeout(time: 5, unit: 'MINUTES')
+                    }
+                    steps {
+                        dir('frontend') {
+                            // Static analysis with flutter_lints
+                            // (analysis_options.yaml). Any issue fails the build.
+                            sh 'flutter analyze'
+                        }
+                    }
+                    post {
+                        failure {
+                            script { env.CURRENT_STAGE = env.STAGE_NAME }
+                        }
+                    }
+                }
+
+                stage('Unit Test') {
+                    options {
+                        timeout(time: 10, unit: 'MINUTES')
+                    }
+                    steps {
+                        dir('frontend') {
+                            sh 'flutter test --coverage'
+                            // lcov has no Jenkins coverage parser, so print the
+                            // line-coverage total and archive the report.
+                            sh '''
+                                awk -F: '/^LF:/ { total += $2 } /^LH:/ { hit += $2 }
+                                  END { printf "Line coverage: %.1f%% (%d of %d lines)\\n", hit * 100 / total, hit, total }' coverage/lcov.info
+                            '''
+                        }
+                    }
+                    post {
+                        always {
+                            archiveArtifacts artifacts: 'frontend/coverage/lcov.info', allowEmptyArchive: true
+                        }
+                        failure {
+                            script { env.CURRENT_STAGE = env.STAGE_NAME }
+                        }
+                    }
+                }
+
+                stage('SCA — osv-scanner') {
+                    // Known vulnerabilities (osv.dev) in the Dart/Flutter
+                    // packages pinned by pubspec.lock. Its own small container.
+                    agent {
+                        docker {
+                            image 'ghcr.io/google/osv-scanner:v2.6.0'
+                            label 'linux-build'
+                            args '--entrypoint= -e HOME=/tmp'
+                        }
+                    }
+                    options {
+                        timeout(time: 5, unit: 'MINUTES')
+                    }
+                    steps {
+                        // 1) SARIF report, always kept (exit code ignored here).
+                        sh '/osv-scanner scan source --lockfile=frontend/pubspec.lock --format sarif --output osv-scanner.sarif || true'
+                        // 2) The gate: exits 1 on any known vulnerability, and
+                        //    prints the findings as a table.
+                        sh '/osv-scanner scan source --lockfile=frontend/pubspec.lock'
+                    }
+                    post {
+                        always {
+                            archiveArtifacts artifacts: 'osv-scanner.sarif', allowEmptyArchive: true
+                        }
+                        failure {
+                            script { env.CURRENT_STAGE = env.STAGE_NAME }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build — Debug APK') {
+            // Every branch and PR: proves the Android build works and gives
+            // testers an installable APK for this commit.
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                dir('frontend') {
+                    sh 'flutter build apk --debug --build-number "$BUILD_NUMBER"'
+                }
+            }
+            post {
+                success {
+                    archiveArtifacts artifacts: 'frontend/build/app/outputs/flutter-apk/app-debug.apk', fingerprint: true
+                }
+            }
+        }
+
+        stage('Build — Release AAB (signed)') {
+            // Only main produces a store-ready bundle, signed with the upload
+            // key. The keystore and its password exist only in Jenkins
+            // credentials; android/app/build.gradle.kts reads them from the
+            // environment variables bound here.
+            when {
+                branch 'main'
+            }
+            environment {
+                ANDROID_KEY_ALIAS = 'upload'
+                AAB = 'build/app/outputs/bundle/release/app-release.aab'
+            }
+            steps {
+                script { env.CURRENT_STAGE = env.STAGE_NAME }
+                withCredentials([
+                    file(credentialsId: 'android-keystore', variable: 'ANDROID_KEYSTORE_PATH'),
+                    string(credentialsId: 'android-keystore-password', variable: 'ANDROID_KEYSTORE_PASSWORD'),
+                ]) {
+                    dir('frontend') {
+                        sh 'flutter build appbundle --release --build-number "$BUILD_NUMBER"'
+                    }
+                }
+                dir('frontend') {
+                    // Prove what was signed: the signature must verify, and the
+                    // certificate must be the upload key, never the debug key
+                    // that build.gradle.kts falls back to without credentials.
+                    sh '''
+                        jarsigner -verify "$AAB"
+                        keytool -printcert -jarfile "$AAB" | tee aab-certificate.txt
+                        if grep -q "CN=Android Debug" aab-certificate.txt; then
+                            echo "Release AAB is signed with the debug key - refusing to publish it"
+                            exit 1
+                        fi
+                    '''
+                }
+            }
+            post {
+                success {
+                    archiveArtifacts artifacts: 'frontend/build/app/outputs/bundle/release/app-release.aab, frontend/aab-certificate.txt', fingerprint: true
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ ${env.APP_NAME} pipeline passed on branch ${env.BRANCH_NAME}"
+        }
+        failure {
+            echo "❌ ${env.APP_NAME} failed at stage: ${env.CURRENT_STAGE}"
+        }
+        cleanup {
+            // The container ran as root: hand everything it created back to
+            // the agent's user (the owner of the workspace directory), so the
+            // next checkout and workspace cleanup on linux-build still work.
+            sh 'chown -R "$(stat -c %u:%g "$WORKSPACE")" "$WORKSPACE"'
+        }
+    }
+}
