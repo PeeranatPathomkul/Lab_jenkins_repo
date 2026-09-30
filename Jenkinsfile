@@ -526,8 +526,11 @@ pipeline {
                         // branch build and its PR build from the same push). No host
                         // ports are published (docker-compose.ci.yml), so the project
                         // name is the only thing that has to differ. The network the
-                        // Playwright container joins is poonsuk-e2e-<executor>_default.
-                        COMPOSE = 'docker compose -p poonsuk-e2e-$EXECUTOR_NUMBER -f docker-compose.yml -f docker-compose.ci.yml'
+                        // Playwright container joins is <E2E_PROJECT>_default.
+                        // Interpolated by Groovy here: the shell does not expand a
+                        // `$VAR` that sits inside another variable's value.
+                        E2E_PROJECT = "poonsuk-e2e-${env.EXECUTOR_NUMBER}"
+                        COMPOSE = "docker compose -p ${E2E_PROJECT} -f docker-compose.yml -f docker-compose.ci.yml"
                     }
                     steps {
                         dir('backend') {
@@ -546,7 +549,7 @@ pipeline {
                         }
                         script {
                             docker.image('mcr.microsoft.com/playwright:v1.63.0-noble')
-                                .inside("--network poonsuk-e2e-${env.EXECUTOR_NUMBER}_default -e HOME=/tmp -e npm_config_cache=/tmp/.npm -e CI=true -e E2E_BASE_URL=http://api:3000") {
+                                .inside("--network ${env.E2E_PROJECT}_default -e HOME=/tmp -e npm_config_cache=/tmp/.npm -e CI=true -e E2E_BASE_URL=http://api:3000") {
                                     dir('e2e') {
                                         sh 'npm ci'
                                         sh 'npx playwright test'
