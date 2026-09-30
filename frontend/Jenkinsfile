@@ -2,21 +2,26 @@
 // taskflow-mobile). Runs as its own multibranch job, `taskflow-mobile`, with
 // Script Path frontend/Jenkinsfile; the API keeps the root Jenkinsfile.
 pipeline {
-    // A plain linux-build executor (it has the Docker CLI) for the whole run.
-    // Each stage starts its tool container on it with `reuseNode true`, so all
-    // containers share this one workspace (pub get once, Gradle caches, the
-    // APK). A Docker agent at this level would not work: a stage's own Docker
-    // agent (osv-scanner) would then run `docker` inside the Flutter container,
-    // which has no Docker CLI.
-    agent { label 'linux-build' }
+    // One Kubernetes dynamic agent for the whole run: a pod in the kind cluster
+    // (ci/k8s/flutter.yaml) with a Flutter container and an osv-scanner
+    // container over one shared workspace, created for this build and deleted
+    // after it. Nothing waits for a person here, so holding one pod is fine,
+    // and pub get / the Gradle daemon are paid for once.
+    agent {
+        kubernetes {
+            cloud 'kind'
+            yamlFile 'ci/k8s/flutter.yaml'
+            defaultContainer 'flutter'
+        }
+    }
 
     environment {
         APP_NAME = 'hotel_booking'
     }
 
     options {
-        // Nothing here waits for a person, so the whole run is bounded. A cold
-        // run (empty caches: Gradle, Android deps, NDK) takes ~15-20 minutes.
+        // Bounded run, pod start included. A cold run (Flutter image pull, empty
+        // Gradle/Android/NDK caches on the kind node) can take ~20-30 minutes.
         timeout(time: 45, unit: 'MINUTES')
     }
 
@@ -38,21 +43,6 @@ pipeline {
             }
             stages {
                 stage('Setup') {
-                    agent {
-                        docker {
-                            // ghcr.io/cirruslabs/flutter:stable is 3.44.0 today (same
-                            // digest); pinned so a new `stable` cannot silently change
-                            // the toolchain.
-                            image 'ghcr.io/cirruslabs/flutter:3.44.0'
-                            reuseNode true
-                            // -u 0:0: the SDK (/sdks/flutter, /opt/android-sdk-linux)
-                            // belongs to root, and Flutter/Gradle write into it (tool
-                            // lock, NDK). Named volumes keep the pub cache, Gradle
-                            // caches and the NDK between builds. (Same args on every
-                            // Flutter stage below.)
-                            args '-u 0:0 -e HOME=/root -v flutter_pub_cache:/root/.pub-cache -v flutter_gradle:/root/.gradle -v android_ndk:/opt/android-sdk-linux/ndk'
-                        }
-                    }
                     steps {
                         script { env.CURRENT_STAGE = env.STAGE_NAME }
                         sh 'flutter --version'
@@ -60,9 +50,10 @@ pipeline {
                         // Docker host has ~7.6 GB for everything (Jenkins, SonarQube,
                         // kind...), and a release build with 3 GB + a separate Kotlin
                         // daemon ran it out of memory. Settings in GRADLE_USER_HOME
-                        // (the flutter_gradle volume) win over the project's, so CI
-                        // caps the build - one 2 GB JVM, Kotlin compiled inside it,
-                        // two workers - without changing what developers get locally.
+                        // (/root/.gradle, cached on the kind node) win over the
+                        // project's, so CI caps the build - one 2 GB JVM, Kotlin
+                        // compiled inside it, two workers - without changing what
+                        // developers get locally.
                         sh '''
                             printf '%s\\n' \
                               'org.gradle.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=768m' \
@@ -87,13 +78,6 @@ pipeline {
                     failFast true
                     parallel {
                         stage('Analyze') {
-                            agent {
-                                docker {
-                                    image 'ghcr.io/cirruslabs/flutter:3.44.0'
-                                    reuseNode true
-                                    args '-u 0:0 -e HOME=/root -v flutter_pub_cache:/root/.pub-cache -v flutter_gradle:/root/.gradle -v android_ndk:/opt/android-sdk-linux/ndk'
-                                }
-                            }
                             options {
                                 // ~10 s normally. The analysis server once spun for 20+
                                 // minutes while the Docker VM was swapping; fail fast
@@ -115,13 +99,6 @@ pipeline {
                         }
 
                         stage('Unit Test') {
-                            agent {
-                                docker {
-                                    image 'ghcr.io/cirruslabs/flutter:3.44.0'
-                                    reuseNode true
-                                    args '-u 0:0 -e HOME=/root -v flutter_pub_cache:/root/.pub-cache -v flutter_gradle:/root/.gradle -v android_ndk:/opt/android-sdk-linux/ndk'
-                                }
-                            }
                             options {
                                 timeout(time: 10, unit: 'MINUTES')
                             }
@@ -148,23 +125,18 @@ pipeline {
 
                         stage('SCA — osv-scanner') {
                             // Known vulnerabilities (osv.dev) in the Dart/Flutter
-                            // packages pinned by pubspec.lock. Its own small container.
-                            agent {
-                                docker {
-                                    image 'ghcr.io/google/osv-scanner:v2.6.0'
-                                    reuseNode true
-                                    args '--entrypoint= -e HOME=/tmp'
-                                }
-                            }
+                            // packages pinned by pubspec.lock.
                             options {
                                 timeout(time: 5, unit: 'MINUTES')
                             }
                             steps {
-                                // 1) SARIF report, always kept (exit code ignored here).
-                                sh '/osv-scanner scan source --lockfile=frontend/pubspec.lock --format sarif --output osv-scanner.sarif || true'
-                                // 2) The gate: exits 1 on any known vulnerability, and
-                                //    prints the findings as a table.
-                                sh '/osv-scanner scan source --lockfile=frontend/pubspec.lock'
+                                container('osv-scanner') {
+                                    // 1) SARIF report, always kept (exit code ignored here).
+                                    sh '/osv-scanner scan source --lockfile=frontend/pubspec.lock --format sarif --output osv-scanner.sarif || true'
+                                    // 2) The gate: exits 1 on any known vulnerability, and
+                                    //    prints the findings as a table.
+                                    sh '/osv-scanner scan source --lockfile=frontend/pubspec.lock'
+                                }
                             }
                             post {
                                 always {
@@ -184,13 +156,6 @@ pipeline {
                     // phones): less to compile and a much smaller file than the
                     // default multi-ABI debug APK (156 MB). The release AAB below
                     // keeps every ABI.
-                    agent {
-                        docker {
-                            image 'ghcr.io/cirruslabs/flutter:3.44.0'
-                            reuseNode true
-                            args '-u 0:0 -e HOME=/root -v flutter_pub_cache:/root/.pub-cache -v flutter_gradle:/root/.gradle -v android_ndk:/opt/android-sdk-linux/ndk'
-                        }
-                    }
                     steps {
                         script { env.CURRENT_STAGE = env.STAGE_NAME }
                         dir('frontend') {
@@ -210,15 +175,7 @@ pipeline {
                     // credentials; android/app/build.gradle.kts reads them from the
                     // environment variables bound here.
                     when {
-                        beforeAgent true
                         branch 'main'
-                    }
-                    agent {
-                        docker {
-                            image 'ghcr.io/cirruslabs/flutter:3.44.0'
-                            reuseNode true
-                            args '-u 0:0 -e HOME=/root -v flutter_pub_cache:/root/.pub-cache -v flutter_gradle:/root/.gradle -v android_ndk:/opt/android-sdk-linux/ndk'
-                        }
                     }
                     environment {
                         ANDROID_KEY_ALIAS = 'upload'
@@ -264,17 +221,6 @@ pipeline {
         }
         failure {
             echo "❌ ${env.APP_NAME} failed at stage: ${env.CURRENT_STAGE}"
-        }
-        cleanup {
-            // The Flutter containers ran as root in this workspace: hand what they
-            // created back to the agent's user (the owner of the workspace
-            // directory), so the next checkout and workspace cleanup still work.
-            // chown needs root, so it runs in a throwaway root container.
-            script {
-                docker.image('ghcr.io/cirruslabs/flutter:3.44.0').inside('-u 0:0') {
-                    sh 'chown -R "$(stat -c %u:%g "$WORKSPACE")" "$WORKSPACE"'
-                }
-            }
         }
     }
 }
