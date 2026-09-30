@@ -17,6 +17,8 @@ pipeline {
 
     environment {
         APP_NAME = 'hotel_booking'
+        // Lab 10: who gets the success/failure e-mail (see notifyBuild below).
+        NOTIFY_EMAIL = 'dev-team@poonsuk.lab'
     }
 
     options {
@@ -218,9 +220,38 @@ pipeline {
     post {
         success {
             echo "✅ ${env.APP_NAME} pipeline passed on branch ${env.BRANCH_NAME}"
+            script { notifyBuild('SUCCESS') }
         }
         failure {
             echo "❌ ${env.APP_NAME} failed at stage: ${env.CURRENT_STAGE}"
+            script { notifyBuild('FAILURE') }
         }
+    }
+}
+
+// Lab 10: e-mail the result with the branch and a link to the build (same
+// helper as the API Jenkinsfile). Sent by the Mailer plugin through the SMTP
+// server set under Manage Jenkins -> System -> E-mail Notification (in the lab:
+// Mailpit). A mail problem is logged but never changes the build result.
+def notifyBuild(String result) {
+    def body = [
+        "Job:       ${env.JOB_NAME}",
+        "Branch:    ${env.BRANCH_NAME}",
+        "Build:     #${env.BUILD_NUMBER}",
+        "Result:    ${result}",
+    ]
+    if (result == 'FAILURE') {
+        body << "Failed at: ${env.CURRENT_STAGE}"
+    }
+    body << "Duration:  ${currentBuild.durationString.replace(' and counting', '')}"
+    body << "Build URL: ${env.BUILD_URL}"
+    try {
+        mail(
+            to: env.NOTIFY_EMAIL,
+            subject: "${result == 'SUCCESS' ? '✅' : '❌'} ${env.APP_NAME} [${env.BRANCH_NAME}] #${env.BUILD_NUMBER}: ${result}",
+            body: body.join('\n')
+        )
+    } catch (err) {
+        echo "Notification e-mail not sent: ${err.message}"
     }
 }

@@ -10,6 +10,8 @@ pipeline {
     environment {
         APP_NAME = 'poonsuk-api'
         NODE_ENV = 'test'
+        // Lab 10: who gets the success/failure e-mail (see notifyBuild below).
+        NOTIFY_EMAIL = 'dev-team@poonsuk.lab'
     }
 
     parameters {
@@ -297,8 +299,9 @@ pipeline {
                                             // package and version), tagged with the commit it describes.
                                             // node_modules is excluded: Install may be filling it right
                                             // now, and the lockfile already lists every package.
+                                            // The binary is /syft (not on the image's PATH).
                                             sh '''
-                                                syft scan dir:backend --exclude './node_modules/**' \
+                                                /syft scan dir:backend --exclude './node_modules/**' \
                                                   --source-name poonsuk-api --source-version "$GIT_COMMIT" \
                                                   -o cyclonedx-json="$SBOM"
                                             '''
@@ -1073,9 +1076,39 @@ pipeline {
     post {
         success {
             echo "✅ ${env.APP_NAME} pipeline passed on branch ${env.BRANCH_NAME ?: 'main'} (NODE_ENV=${env.NODE_ENV})"
+            script { notifyBuild('SUCCESS') }
         }
         failure {
             echo "❌ ${env.APP_NAME} failed at stage: ${env.CURRENT_STAGE}"
+            script { notifyBuild('FAILURE') }
         }
+    }
+}
+
+// Lab 10: e-mail the result with the branch and a link to the build. Sent by
+// the Mailer plugin through the SMTP server set under Manage Jenkins -> System
+// -> E-mail Notification (in the lab: Mailpit, http://127.0.0.1:8025). A mail
+// problem is logged but never changes the build result.
+def notifyBuild(String result) {
+    def branch = env.BRANCH_NAME ?: 'main'
+    def body = [
+        "Job:       ${env.JOB_NAME}",
+        "Branch:    ${branch}",
+        "Build:     #${env.BUILD_NUMBER}",
+        "Result:    ${result}",
+    ]
+    if (result == 'FAILURE') {
+        body << "Failed at: ${env.CURRENT_STAGE}"
+    }
+    body << "Duration:  ${currentBuild.durationString.replace(' and counting', '')}"
+    body << "Build URL: ${env.BUILD_URL}"
+    try {
+        mail(
+            to: env.NOTIFY_EMAIL,
+            subject: "${result == 'SUCCESS' ? '✅' : '❌'} ${env.APP_NAME} [${branch}] #${env.BUILD_NUMBER}: ${result}",
+            body: body.join('\n')
+        )
+    } catch (err) {
+        echo "Notification e-mail not sent: ${err.message}"
     }
 }
