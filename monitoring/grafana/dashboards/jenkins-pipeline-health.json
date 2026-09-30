@@ -31,6 +31,15 @@
           "min": 0,
           "max": 1,
           "noValue": "no finished builds in range",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": { "text": "no finished builds in range", "color": "text" }
+              }
+            }
+          ],
           "thresholds": {
             "mode": "absolute",
             "steps": [
