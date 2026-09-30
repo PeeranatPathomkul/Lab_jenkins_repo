@@ -372,17 +372,25 @@ pipeline {
         }
 
         stage('CI') {
-            // Run every CI step inside a throwaway node:20-alpine container,
-            // started on the linux-build agent (the only node with a Docker CLI
-            // + host socket).
+            // Lab 09: every CI step runs in a fresh Kubernetes pod in the kind
+            // cluster (cloud `kind`, namespace jenkins-agents), created for this
+            // run and deleted afterwards — instead of a container on the static
+            // linux-build agent (Lab 03). The plugin adds the `jnlp` container
+            // that connects back to Jenkins; steps run in `node`.
             agent {
-                docker {
-                    image 'node:20-alpine'
-                    label 'linux-build'
-                    // The container runs as the agent's UID, which has no writable
-                    // home directory inside node:20-alpine, so point npm's cache
-                    // at /tmp.
-                    args '-e npm_config_cache=/tmp/.npm'
+                kubernetes {
+                    cloud 'kind'
+                    defaultContainer 'node'
+                    yaml '''
+                        apiVersion: v1
+                        kind: Pod
+                        spec:
+                          containers:
+                          - name: node
+                            image: node:20-alpine
+                            command: ['cat']
+                            tty: true
+                    '''
                 }
             }
             options {
@@ -444,6 +452,10 @@ pipeline {
                                 id: 'unit-coverage',
                                 name: 'Unit Test Coverage'
                             )
+                            // The pod (and its workspace) is deleted after CI;
+                            // SonarQube Analysis runs on linux-build and needs the
+                            // coverage report, so hand it over explicitly.
+                            stash name: 'coverage', includes: 'backend/coverage/lcov.info', allowEmpty: true
                         }
                     }
                 }
@@ -543,6 +555,9 @@ pipeline {
             }
             steps {
                 script { env.CURRENT_STAGE = env.STAGE_NAME }
+                // Coverage now comes from the CI pod (Lab 09), not a shared
+                // linux-build workspace.
+                unstash 'coverage'
                 // Injects SONAR_HOST_URL and the sonar-token credential configured
                 // under Manage Jenkins -> System -> SonarQube servers.
                 withSonarQubeEnv('SonarQube') {
