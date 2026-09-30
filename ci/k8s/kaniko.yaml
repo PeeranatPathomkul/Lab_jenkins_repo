@@ -1,0 +1,12 @@
+# Pod for Build Image. Kaniko builds the Dockerfile in user space and pushes
+# straight to the registry - no Docker daemon or socket needed, so the image is
+# built on a Kubernetes agent like everything else. (Kaniko is archived
+# upstream; v1.23.2 is its last release. -debug adds busybox for `sh`.)
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: kaniko
+      image: gcr.io/kaniko-project/executor:v1.23.2-debug
+      command: ["/busybox/cat"]
+      tty: true

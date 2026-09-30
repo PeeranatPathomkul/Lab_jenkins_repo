@@ -1,0 +1,32 @@
+# Pod for the whole mobile pipeline (frontend/Jenkinsfile). Flutter runs as
+# root (the SDK in the image belongs to root and Flutter/Gradle write into it);
+# pub, Gradle and NDK downloads are cached on the kind node between builds.
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: flutter
+      # ghcr.io/cirruslabs/flutter:stable is 3.44.0 today (same digest); pinned
+      # so a new `stable` cannot silently change the toolchain.
+      image: ghcr.io/cirruslabs/flutter:3.44.0
+      command: ["cat"]
+      tty: true
+      env:
+        - { name: HOME, value: /root }
+      volumeMounts:
+        - { name: pub-cache, mountPath: /root/.pub-cache }
+        - { name: gradle-home, mountPath: /root/.gradle }
+        - { name: android-ndk, mountPath: /opt/android-sdk-linux/ndk }
+    - name: osv-scanner
+      image: ghcr.io/google/osv-scanner:v2.6.0
+      command: ["cat"]
+      tty: true
+      env:
+        - { name: HOME, value: /tmp }
+  volumes:
+    - name: pub-cache
+      hostPath: { path: /var/cache/jenkins-ci/pub, type: DirectoryOrCreate }
+    - name: gradle-home
+      hostPath: { path: /var/cache/jenkins-ci/gradle, type: DirectoryOrCreate }
+    - name: android-ndk
+      hostPath: { path: /var/cache/jenkins-ci/android-ndk, type: DirectoryOrCreate }

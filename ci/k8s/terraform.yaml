@@ -1,0 +1,25 @@
+# Pod for Terraform Plan / Apply. LocalStack (S3 state + mock EC2) is reached
+# as http://localstack:4566 on the kind network. The Docker provider creates
+# the host container through docker-proxy, a socket proxy on the kind network
+# that exposes only the Docker API calls Terraform needs - the pod itself gets
+# no Docker socket.
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: terraform
+      image: hashicorp/terraform:1.16.4
+      command: ["cat"]
+      tty: true
+      env:
+        - { name: HOME, value: /tmp }
+        - { name: TF_IN_AUTOMATION, value: "1" }
+        - { name: TF_PLUGIN_CACHE_DIR, value: /cache/terraform }
+        - { name: TF_VAR_docker_host, value: "tcp://docker-proxy:2375" }
+        # Put the host on the kind network, where the Ansible pod can reach it.
+        - { name: TF_VAR_host_network, value: kind }
+      volumeMounts:
+        - { name: terraform-cache, mountPath: /cache/terraform }
+  volumes:
+    - name: terraform-cache
+      hostPath: { path: /var/cache/jenkins-ci/terraform, type: DirectoryOrCreate }

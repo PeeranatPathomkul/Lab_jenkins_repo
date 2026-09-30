@@ -14,11 +14,11 @@ output "instance_public_ip" {
 }
 
 output "instance_address" {
-  description = "Address of the real host Ansible configures (container on the jenkins network)."
+  description = "Address of the real host Ansible configures (container on var.host_network)."
   value       = docker_container.host.network_data[0].ip_address
 }
 
 output "instance_hostname" {
-  description = "DNS name of the real host on the jenkins network."
+  description = "DNS name of the real host on var.host_network."
   value       = docker_container.host.hostname
 }

@@ -1,10 +1,10 @@
 import { defineConfig } from '@playwright/test';
 
 /**
- * End-to-end API suite for poonsuk-api. In Jenkins the API runs from
- * backend/docker-compose.yml + docker-compose.ci.yml and these tests run in the
- * mcr.microsoft.com/playwright container on the same compose network, so the
- * API is reachable as http://api:3000.
+ * End-to-end API suite for poonsuk-api. In Jenkins (Lab 10) the API image,
+ * Postgres, Redis and the mcr.microsoft.com/playwright container share one
+ * Kubernetes pod, so the API is reachable as http://127.0.0.1:3000
+ * (E2E_BASE_URL). Locally it can run against backend/docker-compose.ci.yml.
  */
 export default defineConfig({
   testDir: './tests',

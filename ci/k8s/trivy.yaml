@@ -1,0 +1,19 @@
+# Pod for Container Scan. The vulnerability DB lives on the kind node
+# (hostPath), so it is downloaded once, not on every build.
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: trivy
+      image: aquasec/trivy:0.74.0
+      command: ["cat"]
+      tty: true
+      env:
+        - { name: TRIVY_CACHE_DIR, value: /cache/trivy }
+        # registry:5000 is plain HTTP inside the lab network.
+        - { name: TRIVY_INSECURE, value: "true" }
+      volumeMounts:
+        - { name: trivy-cache, mountPath: /cache/trivy }
+  volumes:
+    - name: trivy-cache
+      hostPath: { path: /var/cache/jenkins-ci/trivy, type: DirectoryOrCreate }
